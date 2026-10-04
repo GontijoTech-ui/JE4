@@ -1,7 +1,9 @@
 package com.gontijotech.gtstore.client.ui
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -9,6 +11,8 @@ import android.os.Bundle
 import android.widget.Button
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import com.gontijotech.gtstore.client.service.LocalBridgeService
 import java.net.InetAddress
 import java.nio.ByteBuffer
@@ -21,15 +25,22 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnToggle: Button
     private lateinit var btnOpenStore: Button
 
+    companion object {
+        private const val PERMISSION_REQUEST_NOTIFICATIONS = 1001
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 1. Inicia o serviço e o servidor local automaticamente ao abrir a aplicação
+        // 1. Verifica e solicita a permissão de notificações em tempo de execução (Android 13+)
+        checkNotificationPermission()
+
+        // 2. Inicia o serviço e o servidor local logo na abertura da aplicação
         if (!LocalBridgeService.isRunning) {
             startBridgeService()
         }
 
-        // 2. Construção da interface de monitorização
+        // 3. Construção da interface programática
         val layout = android.widget.LinearLayout(this).apply {
             orientation = android.widget.LinearLayout.VERTICAL
             setPadding(48, 64, 48, 64)
@@ -78,6 +89,20 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         updateUi()
+    }
+
+    private fun checkNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                ActivityCompat.requestPermissions(
+                    this,
+                    arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                    PERMISSION_REQUEST_NOTIFICATIONS
+                )
+            }
+        }
     }
 
     private fun toggleService() {
