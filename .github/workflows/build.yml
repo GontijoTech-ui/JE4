@@ -1,0 +1,41 @@
+name: Build Android APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch: # Permite disparar a compilação manualmente pela interface do GitHub
+
+jobs:
+  build:
+    name: Compilar APK (Debug)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Configurar JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Conceder permissão de execução ao Gradle Wrapper
+        run: chmod +x gradlew
+
+      - name: Compilar APK de Debug
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Publicar APK como Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GTSTORE-Cliente-Debug
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 14
