@@ -1,116 +1,186 @@
 package com.gontijotech.gtstore.client.network
 
 import android.content.Context
+import com.gontijotech.gtstore.client.server.LocalBridgeServer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
-import java.io.OutputStream
+import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.ServerSocket
 import java.net.Socket
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.nio.charset.StandardCharsets
 
 class Ps4Payloader(private val context: Context) {
 
-    // Placeholder padrão dentro do binário (caso o payload tenha uma string para substituição)
-    private val URL_PLACEHOLDER = "__GTSTORE_PKG_URL_PLACEHOLDER____________________________________________________________________"
-
     /**
-     * Injeta 100% via payload.bin na porta 9090 do PS4.
-     * 
-     * @param ps4Ip IP do console na rede local (ex: 192.168.1.15)
-     * @param pkgUrl URL pública do jogo (ex: https://loja.gontijotech.com.br/download/jogo.pkg)
+     * Executa a injeção DPI completa via porta 9090 e handshake de retorno.
      */
-    suspend fun injectBinaryPayload(ps4Ip: String, pkgUrl: String): Result<Boolean> {
-        return withContext(Dispatchers.IO) {
-            var socket: Socket? = null
-            var out: OutputStream? = null
-            try {
-                // 1. Carrega o payload.bin dos assets
-                val rawBytes = readAssetBinary("payload.bin")
-                    ?: return@withContext Result.failure(Exception("Arquivo payload.bin não encontrado em assets/"))
+    suspend fun injectDpiPayload(
+        ps4Ip: String,
+        manifestUrl: String,
+        itemTitle: String,
+        contentId: String,
+        category: String,
+        fileSize: Long,
+        iconBytes: ByteArray?
+    ): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            // 1. Carrega o payload base dos assets
+            val payloadTemplate = loadPayload("payload.bin") ?: loadPayload("direct-installer.bin")
+                ?: return@withContext Result.failure(Exception("Payload DPI (payload.bin) ausente em assets/."))
 
-                // 2. Patcheia a URL dentro do binário se o placeholder existir
-                val finalPayload = patchPayloadUrl(rawBytes, pkgUrl)
+            val payload = payloadTemplate.copyOf()
 
-                // 3. Conecta no BinLoader do PS4 na porta 9090
-                socket = Socket()
-                socket.connect(InetSocketAddress(ps4Ip, 9090), 6000)
-                out = socket.getOutputStream()
+            // 2. Localiza a assinatura padrão de 5 bytes 0xB4
+            val hookPattern = byteArrayOf(0xB4.toByte(), 0xB4.toByte(), 0xB4.toByte(), 0xB4.toByte(), 0xB4.toByte())
+            val offset = indexOf(payload, hookPattern)
 
-                // 4. Envia o binário bruto
-                out.write(finalPayload)
-                out.flush()
-
-                Result.success(true)
-            } catch (e: Exception) {
-                Result.failure(Exception("Falha ao injetar payload.bin na porta 9090: ${e.message}"))
-            } finally {
-                try { out?.close() } catch (_: Exception) {}
-                try { socket?.close() } catch (_: Exception) {}
+            if (offset < 0) {
+                return@withContext Result.failure(Exception("Assinatura do payload incompatível (offset não encontrado)."))
             }
-        }
-    }
 
-    /**
-     * Lê o arquivo binário da pasta assets/
-     */
-    private fun readAssetBinary(fileName: String): ByteArray? {
-        return try {
-            context.assets.open(fileName).use { input ->
-                val buffer = ByteArrayOutputStream()
-                val data = ByteArray(4096)
-                var count: Int
-                while (input.read(data).also { count = it } != -1) {
-                    buffer.write(data, 0, count)
+            // 3. Determina o IP do celular na rede local
+            val localIpAddress = getLocalWifiAddress()
+                ?: return@withContext Result.failure(Exception("Não foi possível identificar o IP Wi-Fi local do celular."))
+
+            val localAddr = InetAddress.getByName(localIpAddress)
+
+            // 4. Cria socket temporário para receber a resposta do PS4
+            ServerSocket(0, 5, localAddr).use { tempServer ->
+                tempServer.soTimeout = 15_000
+                val callbackPort = tempServer.localPort
+
+                // Grava IP e porta de retorno no payload binário
+                localAddr.address.copyInto(payload, offset)
+                payload[offset + 4] = (callbackPort ushr 8).toByte()
+                payload[offset + 5] = callbackPort.toByte()
+
+                // 5. Envia o binário para o BinLoader do PS4 (porta 9090)
+                val socketResult = sendToBinLoader(ps4Ip, payload)
+                if (!socketResult) {
+                    return@withContext Result.failure(Exception("Falha ao conectar no BinLoader do PS4 (porta 9090)."))
                 }
-                buffer.toByteArray()
+
+                // 6. Aguarda o PS4 conectar de volta e envia os metadados binários (buildDpiInfo)
+                tempServer.accept().use { ps4Client ->
+                    ps4Client.soTimeout = 10_000
+                    val output = ps4Client.getOutputStream()
+                    output.write(buildDpiInfo(manifestUrl, itemTitle, contentId, category, fileSize, iconBytes))
+                    output.flush()
+                }
             }
+
+            Result.success(true)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    private fun buildDpiInfo(
+        url: String,
+        title: String,
+        contentId: String,
+        category: String,
+        size: Long,
+        icon: ByteArray?
+    ): ByteArray {
+        val out = ByteArrayOutputStream()
+
+        fun i32(v: Int) {
+            out.write(ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(v).array())
+        }
+
+        fun i64(v: Long) {
+            out.write(ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putLong(v).array())
+        }
+
+        fun str(s: String) {
+            val b = s.toByteArray(StandardCharsets.UTF_8)
+            i32(b.size)
+            out.write(b)
+        }
+
+        i32(1)
+        str(url)
+        str(title)
+        str(contentId)
+
+        val bgftType = "PS4" + category.uppercase()
+        str(bgftType)
+        i64(size)
+
+        if (icon == null || icon.isEmpty()) {
+            i32(0)
+        } else {
+            i32(icon.size)
+            out.write(icon)
+        }
+
+        return out.toByteArray()
+    }
+
+    private fun sendToBinLoader(ip: String, payload: ByteArray): Boolean {
+        return try {
+            Socket().use { socket ->
+                socket.tcpNoDelay = true
+                socket.soTimeout = 8000
+                socket.connect(InetSocketAddress(ip, 9090), 5000)
+                val out = socket.getOutputStream()
+                out.write(payload)
+                out.flush()
+                try { socket.shutdownOutput() } catch (_: Exception) {}
+            }
+            true
         } catch (_: Exception) {
-            null
+            false
         }
     }
 
-    /**
-     * Substitui o marcador de texto no binário pela URL real do jogo (terminada em byte nulo \0)
-     */
-    private fun patchPayloadUrl(payload: ByteArray, url: String): ByteArray {
-        val searchBytes = URL_PLACEHOLDER.toByteArray(StandardCharsets.US_ASCII)
-        val index = indexOf(payload, searchBytes)
-
-        if (index == -1) {
-            // Se não tem placeholder, envia o binário original intocado
-            return payload
+    private fun loadPayload(name: String): ByteArray? {
+        val targets = listOf("payloads/$name", name)
+        for (target in targets) {
+            try {
+                context.assets.open(target).use { return it.readBytes() }
+            } catch (_: Exception) {}
         }
-
-        val patched = payload.clone()
-        val urlBytes = url.toByteArray(StandardCharsets.US_ASCII)
-
-        // Limpa a área com zeros
-        for (i in 0 until searchBytes.size) {
-            patched[index + i] = 0
-        }
-
-        // Escreve a nova URL
-        val lenToWrite = minOf(urlBytes.size, searchBytes.size - 1)
-        System.arraycopy(urlBytes, 0, patched, index, lenToWrite)
-        patched[index + lenToWrite] = 0 // Null-byte term
-
-        return patched
+        return null
     }
 
-    private fun indexOf(source: ByteArray, target: ByteArray): Int {
-        if (target.isEmpty() || source.size < target.size) return -1
-        for (i in 0..source.size - target.size) {
-            var found = true
-            for (j in target.indices) {
-                if (source[i + j] != target[j]) {
-                    found = false
+    private fun indexOf(data: ByteArray, pattern: ByteArray): Int {
+        if (pattern.isEmpty() || pattern.size > data.size) return -1
+        for (i in 0..data.size - pattern.size) {
+            var match = true
+            for (j in pattern.indices) {
+                if (data[i + j] != pattern[j]) {
+                    match = false
                     break
                 }
             }
-            if (found) return i
+            if (match) return i
         }
         return -1
+    }
+
+    private fun getLocalWifiAddress(): String? {
+        try {
+            val en = java.net.NetworkInterface.getNetworkInterfaces()
+            while (en.hasMoreElements()) {
+                val intf = en.nextElement()
+                if (intf.isLoopback || !intf.isUp) continue
+                val enumIpAddr = intf.inetAddresses
+                while (enumIpAddr.hasMoreElements()) {
+                    val addr = enumIpAddr.nextElement()
+                    if (!addr.isLoopbackAddress && addr is java.net.Inet4Address) {
+                        return addr.hostAddress
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+        return null
     }
 }
