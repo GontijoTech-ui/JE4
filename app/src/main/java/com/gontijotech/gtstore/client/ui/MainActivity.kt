@@ -24,7 +24,12 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Layout construído programaticamente para evitar dependência de XML externo
+        // 1. Inicia o serviço e o servidor local automaticamente ao abrir a aplicação
+        if (!LocalBridgeService.isRunning) {
+            startBridgeService()
+        }
+
+        // 2. Construção da interface de monitorização
         val layout = android.widget.LinearLayout(this).apply {
             orientation = android.widget.LinearLayout.VERTICAL
             setPadding(48, 64, 48, 64)
@@ -68,11 +73,6 @@ class MainActivity : AppCompatActivity() {
         layout.addView(btnOpenStore)
 
         setContentView(layout)
-
-        // Inicia o serviço automaticamente se ainda não estiver rodando
-        if (!LocalBridgeService.isRunning) {
-            startBridgeService()
-        }
     }
 
     override fun onResume() {
@@ -100,12 +100,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateUi() {
         val running = LocalBridgeService.isRunning
-        tvStatus.text = if (running) "Status: ATIVO (Rodando em segundo plano)" else "Status: PARADO"
+        tvStatus.text = if (running) "Status: ATIVO (Servidor pronto)" else "Status: PARADO"
         tvStatus.setTextColor(if (running) 0xFF2ECC71.toInt() else 0xFFFF453A.toInt())
 
         val ip = getWifiIpAddress()
         tvUrl.text = if (running) "Acesse: http://127.0.0.1:8080 ou http://$ip:8080" else "Servidor desligado"
-        btnToggle.text = if (running) "Parar Serviço" else "Iniciar Serviço"
+        btnToggle.text = if (running) "Parar Servidor" else "Iniciar Servidor"
         btnOpenStore.isEnabled = running
     }
 
@@ -122,4 +122,3 @@ class MainActivity : AppCompatActivity() {
         }
     }
 }
-
