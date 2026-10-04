@@ -34,7 +34,8 @@ class LocalBridgeService : Service() {
         startForeground(NOTIF_ID, notification)
 
         if (localServer == null) {
-            localServer = LocalBridgeServer(port = 8080)
+            // Passa o Context ('this') para permitir a leitura do assets/payload.bin
+            localServer = LocalBridgeServer(this, port = 8080)
             try {
                 localServer?.start()
                 isRunning = true
@@ -86,4 +87,3 @@ class LocalBridgeService : Service() {
             .build()
     }
 }
-
