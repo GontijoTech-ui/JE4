@@ -24,7 +24,7 @@ class LocalBridgeServer(
         .readTimeout(30, TimeUnit.SECONDS)
         .build()
 
-    // Inicializa o Payloader com o contexto para leitura de assets/payload.bin
+    // Inicializa o Payloader com o contexto para carregar assets/payload.bin
     private val payloader = Ps4Payloader(context)
 
     override fun serve(session: IHTTPSession): Response {
@@ -37,13 +37,13 @@ class LocalBridgeServer(
 
         return try {
             when {
-                // Endpoint local exclusivo acionado pelo botão da interface web
+                // Rota local exclusiva acionada pela interface web
                 method == Method.POST && uri == "/api/local/inject" -> handleLocalInject(session)
 
-                // Proxy do index.html vindo direto do servidor Admin na nuvem
+                // Proxy do index.html originário do servidor Administrador na nuvem
                 uri == "/" || uri == "/index.html" -> handleProxyStatic("$adminHost/index.html", "text/html")
 
-                // Proxy transparente para todas as outras rotas e assets (/api/..., imagens, etc.)
+                // Encaminhamento transparente de todas as outras rotas e recursos
                 else -> handleProxyForward(session)
             }
         } catch (e: Exception) {
@@ -58,11 +58,23 @@ class LocalBridgeServer(
         val json = JSONObject(map["postData"] ?: "{}")
 
         val ps4Ip = json.getString("ps4Ip")
-        val targetUrl = if (json.has("manifestUrl")) json.getString("manifestUrl") else json.optString("pkgUrl", "")
+        val manifestUrl = if (json.has("manifestUrl")) json.getString("manifestUrl") else json.optString("pkgUrl", "")
+        val title = json.optString("title", "Jogo PS4")
+        val contentId = json.optString("contentId", "CUSA00000")
+        val category = json.optString("category", "gd")
+        val size = json.optLong("size", 0L)
 
-        // Disparo 100% via payload.bin através de Socket TCP na porta 9090
+        // Disparo integral via payload.bin através de socket TCP (porta 9090) com handshake de retorno
         val result = runBlocking {
-            payloader.injectBinaryPayload(ps4Ip, targetUrl)
+            payloader.injectDpiPayload(
+                ps4Ip = ps4Ip,
+                manifestUrl = manifestUrl,
+                itemTitle = title,
+                contentId = contentId,
+                category = category,
+                fileSize = size,
+                iconBytes = null
+            )
         }
 
         val resJson = JSONObject().apply {
@@ -78,7 +90,7 @@ class LocalBridgeServer(
     private fun handleProxyStatic(targetUrl: String, mime: String): Response {
         val req = Request.Builder().url(targetUrl).build()
         val resp = proxyClient.newCall(req).execute()
-        val body = resp.body?.string() ?: "Falha ao carregar interface remota."
+        val body = resp.body?.string() ?: "Falha ao carregar a interface remota."
         return addCors(newFixedLengthResponse(Response.Status.OK, mime, body))
     }
 
