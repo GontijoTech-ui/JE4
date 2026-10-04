@@ -3,14 +3,25 @@
 <!-- ========================================================================= -->
 <script>
 (() => {
+  // =========================================================================
+  // CONFIGURAÇÃO DA API EXTERNA (SERVIDOR ANDROID / CLOUDFLARE)
+  // =========================================================================
+  // Altere para o seu endereço público gerado no túnel do telemóvel
+  const CLOUDFLARE_TUNNEL_URL = "https://seu-subdominio.trycloudflare.com";
+
+  function getApiBaseUrl() {
+    // Permite configurar manualmente no localStorage ou usa a constante padrão
+    return (localStorage.getItem('gtstore_api_url') || CLOUDFLARE_TUNNEL_URL).replace(/\/+$/, '');
+  }
+
   // --- ESTADO GLOBAL DA APLICAÇÃO ---
   let statusPollTimer = null;
   let adminRefreshTimer = null;
   const POLL_INTERVAL_MS = 2500;
-  const MAX_POLL_ATTEMPTS = 120; // ~5 minutos de espera limite
+  const MAX_POLL_ATTEMPTS = 120; // ~5 minutos limite
 
   // =========================================================================
-  // 1. GERENCIAMENTO DE IP DO PS4 (LOCALSTORAGE)
+  // 1. GERENCIAMENTO DE IP DO PS4 E SERVIDOR (LOCALSTORAGE)
   // =========================================================================
   function getPs4Ip() {
     return localStorage.getItem('gtstore_ps4_ip') || '';
@@ -23,7 +34,6 @@
     if (input) input.value = limpo;
   }
 
-  // Inicializa inputs de IP existentes na interface
   document.addEventListener('DOMContentLoaded', () => {
     const input = document.querySelector('.ps4-ip-input');
     const btnSave = document.querySelector('.btn-save-ip');
@@ -34,7 +44,7 @@
     if (btnSave && input) {
       btnSave.addEventListener('click', () => {
         setPs4Ip(input.value);
-        exibirNotificacao("IP do PS4 salvo com sucesso!", "success");
+        exibirNotificacao("IP do PS4 guardado com sucesso!", "success");
       });
     }
   });
@@ -43,10 +53,6 @@
   // 2. CHECKOUT E ENVIO DO PEDIDO (CLIENTE / PS4)
   // =========================================================================
 
-  /**
-   * Chamada principal de finalização do carrinho.
-   * @param {Array<string>} itens - Lista de nomes ou URLs dos arquivos PKG.
-   */
   window.iniciarCheckout = async function(itens) {
     if (!itens || itens.length === 0) {
       exibirNotificacao("O carrinho está vazio.", "warning");
@@ -56,8 +62,8 @@
     try {
       exibirModalProcessamento("Enviando solicitação de autorização...");
 
-      // Requisição em caminho relativo (resolve tanto em LAN quanto em WAN externa)
-      const response = await fetch('/api/order/create', {
+      const endpoint = `${getApiBaseUrl()}/api/order/create`;
+      const response = await fetch(endpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -70,7 +76,7 @@
       });
 
       if (!response.ok) {
-        throw new Error(`Erro na resposta do servidor HTTP (${response.status})`);
+        throw new Error(`Servidor respondeu com código ${response.status}`);
       }
 
       const data = await response.json();
@@ -79,24 +85,22 @@
         throw new Error(data.error || "Servidor não gerou ID para o pedido.");
       }
 
-      console.log(`[GTSTORE] Pedido #${data.orderId} criado com sucesso.`);
       atualizarMensagemModal(
-        `Solicitação <b>#${data.orderId}</b> registrada!<br><br>` +
+        `Solicitação <b>#${data.orderId}</b> registada!<br><br>` +
         `Aguardando autorização na aba <b>Admin</b>...`
       );
 
-      // Inicia a verificação contínua no navegador do PS4
       iniciarLoopPolling(data.orderId);
 
     } catch (err) {
       console.error("[GTSTORE] Erro no checkout:", err);
       fecharModalProcessamento();
-      exibirNotificacao("Falha ao enviar pedido: " + err.message, "error");
+      exibirNotificacao("Falha ao contactar servidor: " + err.message, "error");
     }
   };
 
   // =========================================================================
-  // 3. POLLING DE STATUS NO NAVEGADOR DO CONSOLE (IMUNE A NAT / CGNAT)
+  // 3. POLLING DE STATUS NO NAVEGADOR
   // =========================================================================
 
   function iniciarLoopPolling(orderId) {
@@ -108,8 +112,7 @@
       tentativas++;
 
       try {
-        // no-store e timestamp forçam o navegador WebKit do PS4 a ignorar cache
-        const url = `/api/order/status?id=${encodeURIComponent(orderId)}&_t=${Date.now()}`;
+        const url = `${getApiBaseUrl()}/api/order/status?id=${encodeURIComponent(orderId)}&_t=${Date.now()}`;
         const res = await fetch(url, {
           method: 'GET',
           cache: 'no-store',
@@ -120,31 +123,36 @@
 
         const dados = await res.json();
 
-        // 1. Aprovado pelo Administrador
+        // 1. Pedido Aprovado
         if (dados.status === 'approved') {
           fecharModalProcessamento();
-          exibirNotificacao("Pedido AUTORIZADO pelo Administrador!", "success");
+          exibirNotificacao("Pedido AUTORIZADO com sucesso!", "success");
+
+          // Ativa e renderiza a tela de downloads na interface
+          exibirTelaDeDownloads(dados);
+
+          // Tenta disparar o instalador RPI (porta 12800) em segundo plano
           processarInstalacaoNoConsole(dados);
           return;
         }
 
-        // 2. Rejeitado pelo Administrador
+        // 2. Pedido Rejeitado
         if (dados.status === 'rejected') {
           fecharModalProcessamento();
           exibirNotificacao("A solicitação foi recusada pelo administrador.", "error");
           return;
         }
 
-        // 3. Ainda Pendente
+        // 3. Aguardando decisão
         if (tentativas < MAX_POLL_ATTEMPTS) {
           statusPollTimer = setTimeout(executarChecagem, POLL_INTERVAL_MS);
         } else {
           fecharModalProcessamento();
-          exibirNotificacao("Tempo de espera esgotado. Entre em contato com o suporte.", "warning");
+          exibirNotificacao("Tempo de espera esgotado.", "warning");
         }
 
       } catch (err) {
-        console.warn(`[GTSTORE] Tentativa ${tentativas} falhou. Tentando novamente...`, err);
+        console.warn(`[GTSTORE] Tentativa ${tentativas} falhou.`, err);
         if (tentativas < MAX_POLL_ATTEMPTS) {
           statusPollTimer = setTimeout(executarChecagem, POLL_INTERVAL_MS);
         } else {
@@ -154,33 +162,65 @@
       }
     };
 
-    // Primeira checagem após 1.5s
     statusPollTimer = setTimeout(executarChecagem, 1500);
   }
 
   // =========================================================================
-  // 4. DISPARO LOCAL DE INSTALAÇÃO NO PS4 (RPI - PORTA 12800)
+  // 4. TRANSIÇÃO DE TELA E DISPARO LOCAL (RPI / 12800)
   // =========================================================================
 
-  /**
-   * Como o navegador roda dentro do próprio PS4, chamamos diretamente
-   * a interface de loopback do console (127.0.0.1:12800), contornando
-   * qualquer bloqueio de porta do roteador na internet.
-   */
-  async function processarInstalacaoNoConsole(dadosPedido) {
-    if (!dadosPedido.items || dadosPedido.items.length === 0) {
-      exibirNotificacao("Autorização concluída (nenhum pacote anexado).", "info");
+  function exibirTelaDeDownloads(dadosPedido) {
+    // Oculta catálogo principal
+    const viewCatalog = document.getElementById("view-catalog");
+    if (viewCatalog) viewCatalog.style.display = "none";
+
+    // Exibe secção de downloads
+    const viewDownloads = document.getElementById("view-downloads");
+    if (viewDownloads) {
+      viewDownloads.classList.add("active");
+      viewDownloads.style.display = "block";
+    }
+
+    // Se existir a função original do template, delega para ela
+    if (typeof showDownloadsView === "function") {
+      showDownloadsView();
       return;
     }
 
-    exibirNotificacao(`Enviando ${dadosPedido.items.length} pacote(s) para o instalador...`, "info");
+    // Renderização direta da lista de pacotes caso a função não exista
+    const listContainer = document.getElementById("downloads-list");
+    if (listContainer && dadosPedido.items) {
+      listContainer.innerHTML = "";
+      dadosPedido.items.forEach((urlPkg, idx) => {
+        const nomeArquivo = urlPkg.substring(urlPkg.lastIndexOf('/') + 1) || `Pacote #${idx + 1}`;
+        const itemCard = document.createElement("div");
+        itemCard.style.cssText = `
+          background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.1);
+          border-radius: 12px; padding: 16px; margin-bottom: 12px; display: flex;
+          justify-content: space-between; align-items: center; gap: 12px;
+        `;
+        itemCard.innerHTML = `
+          <div>
+            <div style="font-weight: 800; color: #fff; font-size: 14px;">${nomeArquivo}</div>
+            <div style="font-size: 12px; color: #8a94a6; margin-top: 4px;">Ligação pronta para transferência</div>
+          </div>
+          <a href="${urlPkg}" target="_blank" download style="
+            background: #2ecc71; color: #020305; padding: 10px 18px; border-radius: 8px;
+            text-decoration: none; font-weight: 800; font-size: 12px; display: inline-block;">
+            BAIXAR FICHEIRO
+          </a>
+        `;
+        listContainer.appendChild(itemCard);
+      });
+    }
+  }
+
+  async function processarInstalacaoNoConsole(dadosPedido) {
+    if (!dadosPedido.items || dadosPedido.items.length === 0) return;
 
     for (let i = 0; i < dadosPedido.items.length; i++) {
       const urlPkg = dadosPedido.items[i];
-      console.log(`[GTSTORE] Enviando para instalador local: ${urlPkg}`);
-
       try {
-        // Envio direto para o Remote Package Installer na mesma máquina
         const rpiResponse = await fetch('http://127.0.0.1:12800/server/install', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -191,45 +231,26 @@
         });
 
         if (rpiResponse.ok) {
-          exibirNotificacao(`Instalação iniciada: Pacote ${i + 1}/${dadosPedido.items.length}`, "success");
-        } else {
-          console.warn("[GTSTORE] RPI retornou código: " + rpiResponse.status);
+          exibirNotificacao(`Instalação enviada ao RPI: Pacote ${i + 1}/${dadosPedido.items.length}`, "success");
         }
       } catch (err) {
-        console.warn("[GTSTORE] Falha ao enviar para 127.0.0.1:12800. Tentando IP configurado...", err);
-
-        // Fallback: se o navegador estiver rodando fora do PS4, tenta o IP manual salvo
-        const ipManual = getPs4Ip();
-        if (ipManual) {
-          try {
-            await fetch(`http://${ipManual}:12800/server/install`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ type: "direct", packages: [urlPkg] })
-            });
-            exibirNotificacao(`Enviado via IP manual (${ipManual})`, "success");
-          } catch (_e) {
-            console.error("[GTSTORE] RPI inacessível no IP manual.");
-          }
-        }
+        // Falha esperada caso a aplicação RPI esteja fechada ou ocorra bloqueio de Mixed Content
+        console.warn("[GTSTORE] RPI local inacessível (utilize o botão manual de download).", err);
       }
     }
   }
 
   // =========================================================================
-  // 5. PAINEL DE CONTROLE DO ADMINISTRADOR (ABA ADMIN)
+  // 5. PAINEL DE CONTROLE ADMINISTRATIVO (ABA ADMIN)
   // =========================================================================
 
-  /**
-   * Busca no backend todos os pedidos em espera para renderização na lista do Admin.
-   */
   window.carregarPedidosAdmin = async function(containerElementId = 'admin-orders-list') {
     const container = document.getElementById(containerElementId);
     if (!container) return;
 
     try {
-      const res = await fetch('/api/admin/orders?_t=' + Date.now(), { cache: 'no-store' });
-      if (!res.ok) throw new Error("Falha HTTP " + res.status);
+      const res = await fetch(`${getApiBaseUrl()}/api/admin/orders?_t=${Date.now()}`, { cache: 'no-store' });
+      if (!res.ok) throw new Error("HTTP " + res.status);
       const data = await res.json();
 
       container.innerHTML = '';
@@ -272,16 +293,13 @@
       });
 
     } catch (err) {
-      console.error("[GTSTORE] Erro ao carregar painel admin:", err);
+      console.error("[GTSTORE] Erro ao carregar pedidos admin:", err);
     }
   };
 
-  /**
-   * Envia a decisão de aprovação ou recusa do Administrador.
-   */
   window.decidirPedidoAdmin = async function(orderId, acao) {
     try {
-      const res = await fetch('/api/admin/order/approve', {
+      const res = await fetch(`${getApiBaseUrl()}/api/admin/order/approve`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: orderId, action: acao })
@@ -289,19 +307,16 @@
 
       const data = await res.json();
       if (data.success) {
-        exibirNotificacao(`Pedido #${orderId} ${acao === 'approve' ? 'aprovado' : 'recusado'} com sucesso!`, "success");
+        exibirNotificacao(`Pedido #${orderId} ${acao === 'approve' ? 'autorizado' : 'recusado'}!`, "success");
         window.carregarPedidosAdmin();
       } else {
-        exibirNotificacao("Falha ao registrar ação: " + data.error, "error");
+        exibirNotificacao("Falha: " + data.error, "error");
       }
     } catch (err) {
-      exibirNotificacao("Erro de rede ao responder pedido: " + err.message, "error");
+      exibirNotificacao("Erro de rede: " + err.message, "error");
     }
   };
 
-  /**
-   * Liga a atualização automática da aba de administração.
-   */
   window.iniciarMonitorAdmin = function(containerId) {
     window.carregarPedidosAdmin(containerId);
     if (adminRefreshTimer) clearInterval(adminRefreshTimer);
@@ -332,7 +347,7 @@
                       animation: gt-spin 1s linear infinite;"></div>
           <h3 style="margin: 0 0 12px; font-size: 19px; font-weight: 800; color: #fff;">Aguardando Liberação</h3>
           <div id="gt-modal-msg" style="font-size: 14px; line-height: 1.6; color: #a5c7eb;"></div>
-          <div style="margin-top: 24px; font-size: 11px; color: #8a94a6;">Por favor, mantenha esta página aberta no console.</div>
+          <div style="margin-top: 24px; font-size: 11px; color: #8a94a6;">Mantenha esta página aberta na consola.</div>
         </div>
       `;
       const style = document.createElement('style');
