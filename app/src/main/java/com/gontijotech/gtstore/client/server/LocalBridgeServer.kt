@@ -1,5 +1,6 @@
 package com.gontijotech.gtstore.client.server
 
+import android.content.Context
 import com.gontijotech.gtstore.client.network.Ps4Payloader
 import fi.iki.elonen.NanoHTTPD
 import kotlinx.coroutines.runBlocking
@@ -13,6 +14,7 @@ import java.util.HashMap
 import java.util.concurrent.TimeUnit
 
 class LocalBridgeServer(
+    private val context: Context,
     port: Int = 8080,
     private val adminHost: String = "https://loja.gontijotech.com.br"
 ) : NanoHTTPD(port) {
@@ -22,7 +24,8 @@ class LocalBridgeServer(
         .readTimeout(30, TimeUnit.SECONDS)
         .build()
 
-    private val payloader = Ps4Payloader()
+    // Inicializa o Payloader com o contexto para leitura de assets/payload.bin
+    private val payloader = Ps4Payloader(context)
 
     override fun serve(session: IHTTPSession): Response {
         val uri = session.uri
@@ -55,10 +58,11 @@ class LocalBridgeServer(
         val json = JSONObject(map["postData"] ?: "{}")
 
         val ps4Ip = json.getString("ps4Ip")
-        val manifestUrl = json.getString("manifestUrl")
+        val targetUrl = if (json.has("manifestUrl")) json.getString("manifestUrl") else json.optString("pkgUrl", "")
 
+        // Disparo 100% via payload.bin através de Socket TCP na porta 9090
         val result = runBlocking {
-            payloader.injectRpi(ps4Ip, listOf(manifestUrl))
+            payloader.injectBinaryPayload(ps4Ip, targetUrl)
         }
 
         val resJson = JSONObject().apply {
