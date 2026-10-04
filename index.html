@@ -1,28 +1,75 @@
 <!-- ========================================================================= -->
-<!-- MÓDULO DE SINCRONIZAÇÃO, CHECKOUT, POLLING E PAINEL ADMINISTRATIVO        -->
+<!-- MÓDULO UNIFICADO: CATÁLOGO, CHECKOUT, POLLING E PAINEL ADMIN             -->
 <!-- ========================================================================= -->
 <script>
-(() => {
-  // =========================================================================
-  // CONFIGURAÇÃO DA API EXTERNA (SERVIDOR ANDROID / CLOUDFLARE)
-  // =========================================================================
-  // Altere para o seu endereço público gerado no túnel do telemóvel
-  const CLOUDFLARE_TUNNEL_URL = "https://seu-subdominio.trycloudflare.com";
+// 1. CONFIGURAÇÃO GLOBAL DA API (Acessível por toda a página)
+window.CLOUDFLARE_TUNNEL_URL = "https://loja.gontijotech.com.br";
 
-  function getApiBaseUrl() {
-    // Permite configurar manualmente no localStorage ou usa a constante padrão
-    return (localStorage.getItem('gtstore_api_url') || CLOUDFLARE_TUNNEL_URL).replace(/\/+$/, '');
+window.getApiBaseUrl = function() {
+  return (localStorage.getItem('gtstore_api_url') || window.CLOUDFLARE_TUNNEL_URL).replace(/\/+$/, '');
+};
+
+// 2. CARREGAMENTO DO CATÁLOGO (Impede tela preta se a API demorar ou falhar)
+window.loadPackages = async function() {
+  const container = document.getElementById("catalog") || document.getElementById("view-catalog");
+
+  try {
+    const res = await fetch(`${window.getApiBaseUrl()}/api/packages?_t=${Date.now()}`, { 
+      cache: "no-store",
+      headers: { "Accept": "application/json" }
+    });
+
+    if (!res.ok) throw new Error("Status HTTP: " + res.status);
+
+    const data = await res.json();
+    const lista = data.items || data.packages || [];
+
+    if (lista.length === 0) {
+      if (container) {
+        container.innerHTML = '<div style="color:#8a94a6; text-align:center; padding:60px 20px;">Nenhum jogo cadastrado no servidor Android.</div>';
+      }
+      return;
+    }
+
+    // Se o seu index.html já tiver as funções originais de montagem, repassa os dados:
+    if (typeof buildCatalog === "function" && typeof renderCatalog === "function") {
+      window.allPackages = lista;
+      window.games = buildCatalog(lista);
+      renderCatalog();
+      if (typeof updateCartTopButton === "function") updateCartTopButton();
+    }
+
+  } catch (err) {
+    console.error("[GTSTORE] Falha ao carregar catálogo:", err);
+    if (container) {
+      container.innerHTML = `
+        <div style="text-align:center; padding:50px 20px; color:#f5f7fa; font-family:sans-serif;">
+          <h3 style="color:#ff453a; margin-bottom:8px;">Servidor Temporariamente Inacessível</h3>
+          <p style="color:#8a94a6; font-size:13px; max-width:460px; margin:0 auto 16px;">
+            Não foi possível comunicar com <b>${window.getApiBaseUrl()}</b>.<br>
+            Verifique se o aplicativo no Android e o Cloudflare Tunnel estão ativos.
+          </p>
+          <button onclick="window.loadPackages()" style="background:#0070d1; color:#fff; border:0; padding:10px 20px; border-radius:6px; font-weight:700; cursor:pointer;">
+            Tentar Novamente
+          </button>
+        </div>
+      `;
+    }
   }
+};
 
-  // --- ESTADO GLOBAL DA APLICAÇÃO ---
+// Inicia o catálogo assim que a estrutura do DOM estiver pronta
+document.addEventListener('DOMContentLoaded', () => {
+  window.loadPackages();
+});
+
+(() => {
   let statusPollTimer = null;
   let adminRefreshTimer = null;
   const POLL_INTERVAL_MS = 2500;
-  const MAX_POLL_ATTEMPTS = 120; // ~5 minutos limite
+  const MAX_POLL_ATTEMPTS = 120;
 
-  // =========================================================================
-  // 1. GERENCIAMENTO DE IP DO PS4 E SERVIDOR (LOCALSTORAGE)
-  // =========================================================================
+  // 3. GERENCIAMENTO DE IP DO CONSOLE
   function getPs4Ip() {
     return localStorage.getItem('gtstore_ps4_ip') || '';
   }
@@ -44,15 +91,12 @@
     if (btnSave && input) {
       btnSave.addEventListener('click', () => {
         setPs4Ip(input.value);
-        exibirNotificacao("IP do PS4 guardado com sucesso!", "success");
+        exibirNotificacao("IP do console salvo com sucesso!", "success");
       });
     }
   });
 
-  // =========================================================================
-  // 2. CHECKOUT E ENVIO DO PEDIDO (CLIENTE / PS4)
-  // =========================================================================
-
+  // 4. CHECKOUT E ENVIO DO PEDIDO
   window.iniciarCheckout = async function(itens) {
     if (!itens || itens.length === 0) {
       exibirNotificacao("O carrinho está vazio.", "warning");
@@ -62,7 +106,7 @@
     try {
       exibirModalProcessamento("Enviando solicitação de autorização...");
 
-      const endpoint = `${getApiBaseUrl()}/api/order/create`;
+      const endpoint = `${window.getApiBaseUrl()}/api/order/create`;
       const response = await fetch(endpoint, {
         method: 'POST',
         headers: {
@@ -75,19 +119,16 @@
         })
       });
 
-      if (!response.ok) {
-        throw new Error(`Servidor respondeu com código ${response.status}`);
-      }
-
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
 
       if (!data.success || !data.orderId) {
-        throw new Error(data.error || "Servidor não gerou ID para o pedido.");
+        throw new Error(data.error || "Identificador do pedido não recebido.");
       }
 
       atualizarMensagemModal(
-        `Solicitação <b>#${data.orderId}</b> registada!<br><br>` +
-        `Aguardando autorização na aba <b>Admin</b>...`
+        `Solicitação <b>#${data.orderId}</b> registrada!<br><br>` +
+        `Aguardando autorização no painel <b>Admin</b>...`
       );
 
       iniciarLoopPolling(data.orderId);
@@ -99,20 +140,16 @@
     }
   };
 
-  // =========================================================================
-  // 3. POLLING DE STATUS NO NAVEGADOR
-  // =========================================================================
-
+  // 5. POLLING DE STATUS
   function iniciarLoopPolling(orderId) {
     if (statusPollTimer) clearTimeout(statusPollTimer);
-
     let tentativas = 0;
 
     const executarChecagem = async () => {
       tentativas++;
 
       try {
-        const url = `${getApiBaseUrl()}/api/order/status?id=${encodeURIComponent(orderId)}&_t=${Date.now()}`;
+        const url = `${window.getApiBaseUrl()}/api/order/status?id=${encodeURIComponent(orderId)}&_t=${Date.now()}`;
         const res = await fetch(url, {
           method: 'GET',
           cache: 'no-store',
@@ -120,30 +157,22 @@
         });
 
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
         const dados = await res.json();
 
-        // 1. Pedido Aprovado
         if (dados.status === 'approved') {
           fecharModalProcessamento();
           exibirNotificacao("Pedido AUTORIZADO com sucesso!", "success");
-
-          // Ativa e renderiza a tela de downloads na interface
           exibirTelaDeDownloads(dados);
-
-          // Tenta disparar o instalador RPI (porta 12800) em segundo plano
           processarInstalacaoNoConsole(dados);
           return;
         }
 
-        // 2. Pedido Rejeitado
         if (dados.status === 'rejected') {
           fecharModalProcessamento();
           exibirNotificacao("A solicitação foi recusada pelo administrador.", "error");
           return;
         }
 
-        // 3. Aguardando decisão
         if (tentativas < MAX_POLL_ATTEMPTS) {
           statusPollTimer = setTimeout(executarChecagem, POLL_INTERVAL_MS);
         } else {
@@ -152,7 +181,7 @@
         }
 
       } catch (err) {
-        console.warn(`[GTSTORE] Tentativa ${tentativas} falhou.`, err);
+        console.warn(`[GTSTORE] Falha temporária no polling (${tentativas}):`, err);
         if (tentativas < MAX_POLL_ATTEMPTS) {
           statusPollTimer = setTimeout(executarChecagem, POLL_INTERVAL_MS);
         } else {
@@ -165,29 +194,22 @@
     statusPollTimer = setTimeout(executarChecagem, 1500);
   }
 
-  // =========================================================================
-  // 4. TRANSIÇÃO DE TELA E DISPARO LOCAL (RPI / 12800)
-  // =========================================================================
-
+  // 6. LIBERAÇÃO DA TELA DE DOWNLOADS
   function exibirTelaDeDownloads(dadosPedido) {
-    // Oculta catálogo principal
     const viewCatalog = document.getElementById("view-catalog");
     if (viewCatalog) viewCatalog.style.display = "none";
 
-    // Exibe secção de downloads
     const viewDownloads = document.getElementById("view-downloads");
     if (viewDownloads) {
       viewDownloads.classList.add("active");
       viewDownloads.style.display = "block";
     }
 
-    // Se existir a função original do template, delega para ela
     if (typeof showDownloadsView === "function") {
       showDownloadsView();
       return;
     }
 
-    // Renderização direta da lista de pacotes caso a função não exista
     const listContainer = document.getElementById("downloads-list");
     if (listContainer && dadosPedido.items) {
       listContainer.innerHTML = "";
@@ -202,12 +224,12 @@
         itemCard.innerHTML = `
           <div>
             <div style="font-weight: 800; color: #fff; font-size: 14px;">${nomeArquivo}</div>
-            <div style="font-size: 12px; color: #8a94a6; margin-top: 4px;">Ligação pronta para transferência</div>
+            <div style="font-size: 12px; color: #8a94a6; margin-top: 4px;">Arquivo pronto para transferência</div>
           </div>
           <a href="${urlPkg}" target="_blank" download style="
             background: #2ecc71; color: #020305; padding: 10px 18px; border-radius: 8px;
             text-decoration: none; font-weight: 800; font-size: 12px; display: inline-block;">
-            BAIXAR FICHEIRO
+            BAIXAR ARQUIVO
           </a>
         `;
         listContainer.appendChild(itemCard);
@@ -231,25 +253,21 @@
         });
 
         if (rpiResponse.ok) {
-          exibirNotificacao(`Instalação enviada ao RPI: Pacote ${i + 1}/${dadosPedido.items.length}`, "success");
+          exibirNotificacao(`Instalação enviada ao RPI (${i + 1}/${dadosPedido.items.length})`, "success");
         }
       } catch (err) {
-        // Falha esperada caso a aplicação RPI esteja fechada ou ocorra bloqueio de Mixed Content
         console.warn("[GTSTORE] RPI local inacessível (utilize o botão manual de download).", err);
       }
     }
   }
 
-  // =========================================================================
-  // 5. PAINEL DE CONTROLE ADMINISTRATIVO (ABA ADMIN)
-  // =========================================================================
-
+  // 7. PAINEL DE CONTROLE DO ADMINISTRADOR
   window.carregarPedidosAdmin = async function(containerElementId = 'admin-orders-list') {
     const container = document.getElementById(containerElementId);
     if (!container) return;
 
     try {
-      const res = await fetch(`${getApiBaseUrl()}/api/admin/orders?_t=${Date.now()}`, { cache: 'no-store' });
+      const res = await fetch(`${window.getApiBaseUrl()}/api/admin/orders?_t=${Date.now()}`, { cache: 'no-store' });
       if (!res.ok) throw new Error("HTTP " + res.status);
       const data = await res.json();
 
@@ -275,7 +293,7 @@
           <div>
             <div style="font-weight: 800; color: #fff; font-size: 14px;">Pedido #${order.id}</div>
             <div style="font-size: 12px; color: #8a94a6; margin-top: 4px;">
-              Horário: ${hora} | Itens: <b>${qtd}</b> ${order.ps4Ip ? `| PS4: ${order.ps4Ip}` : ''}
+              Horário: ${hora} | Itens: <b>${qtd}</b> ${order.ps4Ip ? `| Console: ${order.ps4Ip}` : ''}
             </div>
           </div>
           <div style="display: flex; gap: 8px;">
@@ -293,13 +311,13 @@
       });
 
     } catch (err) {
-      console.error("[GTSTORE] Erro ao carregar pedidos admin:", err);
+      console.error("[GTSTORE] Erro ao carregar painel admin:", err);
     }
   };
 
   window.decidirPedidoAdmin = async function(orderId, acao) {
     try {
-      const res = await fetch(`${getApiBaseUrl()}/api/admin/order/approve`, {
+      const res = await fetch(`${window.getApiBaseUrl()}/api/admin/order/approve`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: orderId, action: acao })
@@ -323,10 +341,7 @@
     adminRefreshTimer = setInterval(() => window.carregarPedidosAdmin(containerId), 4000);
   };
 
-  // =========================================================================
-  // 6. COMPONENTES VISUAIS (MODAL E TOASTS)
-  // =========================================================================
-
+  // 8. INTERFACE VISUAL (MODAL E NOTIFICAÇÕES)
   function exibirModalProcessamento(textoHtml) {
     let modal = document.getElementById('gt-modal-processing');
     if (!modal) {
@@ -347,7 +362,7 @@
                       animation: gt-spin 1s linear infinite;"></div>
           <h3 style="margin: 0 0 12px; font-size: 19px; font-weight: 800; color: #fff;">Aguardando Liberação</h3>
           <div id="gt-modal-msg" style="font-size: 14px; line-height: 1.6; color: #a5c7eb;"></div>
-          <div style="margin-top: 24px; font-size: 11px; color: #8a94a6;">Mantenha esta página aberta na consola.</div>
+          <div style="margin-top: 24px; font-size: 11px; color: #8a94a6;">Mantenha esta página aberta no console.</div>
         </div>
       `;
       const style = document.createElement('style');
