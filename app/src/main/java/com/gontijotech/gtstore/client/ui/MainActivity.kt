@@ -14,6 +14,12 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.gontijotech.gtstore.client.service.LocalBridgeService
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -25,6 +31,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnToggle: Button
     private lateinit var btnOpenStore: Button
 
+    private var uiUpdateJob: Job? = null
+
     companion object {
         private const val PERMISSION_REQUEST_NOTIFICATIONS = 1001
     }
@@ -35,12 +43,12 @@ class MainActivity : AppCompatActivity() {
         // 1. Verifica e solicita a permissão de notificações em tempo de execução (Android 13+)
         checkNotificationPermission()
 
-        // 2. Inicia o serviço e o servidor local logo na abertura da aplicação
+        // 2. Inicia o serviço e o servidor local automaticamente se ainda não estiver ativo
         if (!LocalBridgeService.isRunning) {
             startBridgeService()
         }
 
-        // 3. Construção da interface programática
+        // 3. Montagem da interface visual programática
         val layout = android.widget.LinearLayout(this).apply {
             orientation = android.widget.LinearLayout.VERTICAL
             setPadding(48, 64, 48, 64)
@@ -89,6 +97,20 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         updateUi()
+
+        // Mantém a tela sincronizada em tempo real com o estado do servidor em segundo plano
+        uiUpdateJob?.cancel()
+        uiUpdateJob = CoroutineScope(Dispatchers.Main).launch {
+            while (isActive) {
+                updateUi()
+                delay(1000)
+            }
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        uiUpdateJob?.cancel()
     }
 
     private fun checkNotificationPermission() {
@@ -111,7 +133,7 @@ class MainActivity : AppCompatActivity() {
         } else {
             startBridgeService()
         }
-        window.decorView.postDelayed({ updateUi() }, 500)
+        window.decorView.postDelayed({ updateUi() }, 300)
     }
 
     private fun startBridgeService() {
