@@ -1,10 +1,10 @@
 name: Build & Release Assinado
 
 on:
-  workflow_dispatch: # Permite rodar clicando em um botão
+  workflow_dispatch:
   push:
     tags:
-      - 'v*' # Roda quando você cria uma tag (ex: v1.0.0)
+      - 'v*'
 
 permissions:
   contents: write
@@ -34,9 +34,11 @@ jobs:
       - name: Assinar APK
         uses: r0adkll/sign-android-release@v1
         id: sign_apk
+        env:
+          BUILD_TOOLS_VERSION: "34.0.0"
         with:
           releaseDirectory: app/build/outputs/apk/release
-          signingKey: ${{ secrets.SIGNING_KEY }}
+          signingKeyBase64: ${{ secrets.SIGNING_KEY }}
           keyStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
           alias: ${{ secrets.KEY_ALIAS }}
           keyPassword: ${{ secrets.KEY_PASSWORD }}
@@ -44,9 +46,11 @@ jobs:
       - name: Assinar Bundle (AAB para Play Store)
         uses: r0adkll/sign-android-release@v1
         id: sign_aab
+        env:
+          BUILD_TOOLS_VERSION: "34.0.0"
         with:
           releaseDirectory: app/build/outputs/bundle/release
-          signingKey: ${{ secrets.SIGNING_KEY }}
+          signingKeyBase64: ${{ secrets.SIGNING_KEY }}
           keyStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
           alias: ${{ secrets.KEY_ALIAS }}
           keyPassword: ${{ secrets.KEY_PASSWORD }}
