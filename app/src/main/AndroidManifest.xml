@@ -1,9 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- Permissões de rede e conectividade Wi-Fi -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+    <!-- Permissões para execução de serviço em segundo plano -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -16,21 +19,22 @@
         android:theme="@style/Theme.GTStoreClient"
         android:usesCleartextTraffic="true">
 
-        <!-- Serviço em segundo plano persistente -->
+        <!-- Serviço de ponte de injeção em segundo plano -->
         <service
-            android:name=".service.LocalBridgeService"
+            android:name="com.gontijotech.gtstore.client.service.LocalBridgeService"
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="specialUse" />
 
-        <!-- Ecrã principal com arranque automático do serviço -->
+        <!-- Ecrã principal e ponto de entrada no lançador de aplicações -->
         <activity
-            android:name=".ui.MainActivity"
+            android:name="com.gontijotech.gtstore.client.ui.MainActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
-                <action android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
     </application>
 </manifest>
