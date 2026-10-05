@@ -1,0 +1,25 @@
+name: Gerar Keystore
+
+on:
+  workflow_dispatch: # Permite disparar manualmente pelo botão
+
+jobs:
+  gerar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Criar Keystore e converter para Base64
+        run: |
+          keytool -genkeypair -v \
+            -keystore release.jks \
+            -alias app_release \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass "SuaSenhaForteAqui123" \
+            -keypass "SuaSenhaForteAqui123" \
+            -dname "CN=Desenvolvedor, OU=App, O=Dev, L=BR, S=BR, C=BR"
+          
+          echo "=== COPIE O TEXTO ABAIXO PARA O SECRET SIGNING_KEY ==="
+          base64 -w 0 release.jks
+          echo ""
+          echo "======================================================"
