@@ -15,42 +15,45 @@ import com.gontijotech.gtstore.client.ui.MainActivity
 
 class LocalBridgeService : Service() {
 
-    private var localServer: LocalBridgeServer? = null
+    private var server: LocalBridgeServer? = null
 
     companion object {
-        const val CHANNEL_ID = "gtstore_client_channel"
-        const val NOTIF_ID = 2001
-        var isRunning = false
+        const val CHANNEL_ID = "gtstore_bridge_service_channel"
+        const val NOTIFICATION_ID = 8080
+
+        @Volatile
+        var isRunning: Boolean = false
             private set
     }
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        startForeground(NOTIFICATION_ID, buildNotification("Iniciando ponte local..."))
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val notification = buildNotification()
-        startForeground(NOTIF_ID, notification)
-
-        if (localServer == null) {
-            // Passa o Context ('this') para permitir a leitura do assets/payload.bin
-            localServer = LocalBridgeServer(this, port = 8080)
-            try {
-                localServer?.start()
-                isRunning = true
-            } catch (e: Exception) {
-                e.printStackTrace()
+        try {
+            if (server == null) {
+                server = LocalBridgeServer(applicationContext, 8080)
+                server?.start()
             }
+            isRunning = true
+            updateNotification("Servidor ativo na porta 8080")
+        } catch (e: Exception) {
+            isRunning = false
+            updateNotification("Falha ao iniciar servidor: ${e.message}")
         }
 
         return START_STICKY
     }
 
     override fun onDestroy() {
-        localServer?.stop()
-        localServer = null
         isRunning = false
+        try {
+            server?.stop()
+        } catch (_: Exception) {}
+        server = null
         super.onDestroy()
     }
 
@@ -63,14 +66,14 @@ class LocalBridgeService : Service() {
                 "GTSTORE Ponte Local",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Mantém o servidor local ativo para injeção no console"
+                description = "Canal de execução do servidor local de injeção DPI"
             }
             val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             manager.createNotificationChannel(channel)
         }
     }
 
-    private fun buildNotification(): Notification {
+    private fun buildNotification(contentText: String): Notification {
         val pendingIntent = PendingIntent.getActivity(
             this,
             0,
@@ -79,11 +82,17 @@ class LocalBridgeService : Service() {
         )
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("GTSTORE Ponte Ativa")
-            .setContentText("Servidor rodando na porta 8080. Pronto para injetar no PS4.")
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentTitle("GTSTORE Ponte Local")
+            .setContentText(contentText)
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
+    }
+
+    private fun updateNotification(contentText: String) {
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.notify(NOTIFICATION_ID, buildNotification(contentText))
     }
 }
