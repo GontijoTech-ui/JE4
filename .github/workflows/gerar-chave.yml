@@ -15,8 +15,8 @@ jobs:
             -keyalg RSA \
             -keysize 2048 \
             -validity 10000 \
-            -storepass "SuaSenhaForteAqui123" \
-            -keypass "SuaSenhaForteAqui123" \
+            -storepass "M!8sE*MH.c-fp&" \
+            -keypass "M!8sE*MH.c-fp&" \
             -dname "CN=Desenvolvedor, OU=App, O=Dev, L=BR, S=BR, C=BR"
           
           echo "=== COPIE O TEXTO ABAIXO PARA O SECRET SIGNING_KEY ==="
