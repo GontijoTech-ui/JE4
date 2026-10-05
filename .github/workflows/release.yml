@@ -2,6 +2,11 @@ name: Build & Release Assinado
 
 on:
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag da Release (ex: v1.0.0)'
+        required: false
+        default: 'v1.0.0'
   push:
     tags:
       - 'v*'
@@ -22,6 +27,7 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
+          cache: 'gradle'
 
       - name: Dar permissão ao gradlew
         run: chmod +x gradlew
@@ -43,7 +49,7 @@ jobs:
           alias: ${{ secrets.KEY_ALIAS }}
           keyPassword: ${{ secrets.KEY_PASSWORD }}
 
-      - name: Assinar Bundle (AAB para Play Store)
+      - name: Assinar Bundle (AAB)
         uses: r0adkll/sign-android-release@v1
         id: sign_aab
         env:
@@ -55,11 +61,20 @@ jobs:
           alias: ${{ secrets.KEY_ALIAS }}
           keyPassword: ${{ secrets.KEY_PASSWORD }}
 
+      - name: Definir Tag da Release
+        id: release_tag
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
+          fi
+
       - name: Publicar Release no GitHub
         uses: softprops/action-gh-release@v2
         with:
           files: |
             ${{ steps.sign_apk.outputs.signedReleaseFile }}
             ${{ steps.sign_aab.outputs.signedReleaseFile }}
-          tag_name: ${{ github.ref_name || 'v1.0.0' }}
+          tag_name: ${{ steps.release_tag.outputs.tag }}
           generate_release_notes: true
