@@ -1,16 +1,15 @@
 package com.gontijotech.gtstore.client.network
 
 import android.content.Context
-import com.gontijotech.gtstore.client.server.LocalBridgeServer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import org.json.JSONObject
 import java.io.ByteArrayOutputStream
-import java.io.InputStream
+import java.net.ConnectException
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.charset.StandardCharsets
@@ -18,60 +17,69 @@ import java.nio.charset.StandardCharsets
 class Ps4Payloader(private val context: Context) {
 
     /**
-     * Executa a injeção DPI completa via porta 9090 e handshake de retorno.
+     * Executa a injeção DPI completa via BinLoader (porta 9090) e handshake reverso.
+     * @param localIp IP Wi-Fi desta máquina na rede local para retorno do PS4.
      */
     suspend fun injectDpiPayload(
         ps4Ip: String,
+        localIp: String,
         manifestUrl: String,
         itemTitle: String,
         contentId: String,
         category: String,
         fileSize: Long,
-        iconBytes: ByteArray?
+        iconBytes: ByteArray? = null
     ): Result<Boolean> = withContext(Dispatchers.IO) {
         try {
             // 1. Carrega o payload base dos assets
             val payloadTemplate = loadPayload("payload.bin") ?: loadPayload("direct-installer.bin")
-                ?: return@withContext Result.failure(Exception("Payload DPI (payload.bin) ausente em assets/."))
+                ?: return@withContext Result.failure(Exception("Arquivo de payload (payload.bin) ausente na pasta assets."))
 
             val payload = payloadTemplate.copyOf()
 
-            // 2. Localiza a assinatura padrão de 5 bytes 0xB4
-            val hookPattern = byteArrayOf(0xB4.toByte(), 0xB4.toByte(), 0xB4.toByte(), 0xB4.toByte(), 0xB4.toByte())
+            // 2. Localiza a assinatura do hook (6 bytes 0xB4: 4 bytes IP + 2 bytes Porta)
+            val hookPattern = ByteArray(6) { 0xB4.toByte() }
             val offset = indexOf(payload, hookPattern)
 
-            if (offset < 0) {
-                return@withContext Result.failure(Exception("Assinatura do payload incompatível (offset não encontrado)."))
+            if (offset < 0 || offset + 6 > payload.size) {
+                return@withContext Result.failure(Exception("Assinatura do payload incompatível (offset 0xB4 não localizado)."))
             }
 
-            // 3. Determina o IP do celular na rede local
-            val localIpAddress = getLocalWifiAddress()
-                ?: return@withContext Result.failure(Exception("Não foi possível identificar o IP Wi-Fi local do celular."))
+            val localAddr = InetAddress.getByName(localIp)
 
-            val localAddr = InetAddress.getByName(localIpAddress)
-
-            // 4. Cria socket temporário para receber a resposta do PS4
+            // 3. Socket temporário para receber o callback de metadados do PS4
             ServerSocket(0, 5, localAddr).use { tempServer ->
                 tempServer.soTimeout = 15_000
                 val callbackPort = tempServer.localPort
 
-                // Grava IP e porta de retorno no payload binário
+                // Grava IP (4 bytes) e Porta (2 bytes em Big Endian / Network Byte Order)
                 localAddr.address.copyInto(payload, offset)
                 payload[offset + 4] = (callbackPort ushr 8).toByte()
-                payload[offset + 5] = callbackPort.toByte()
+                payload[offset + 5] = (callbackPort and 0xFF).toByte()
 
-                // 5. Envia o binário para o BinLoader do PS4 (porta 9090)
-                val socketResult = sendToBinLoader(ps4Ip, payload)
-                if (!socketResult) {
-                    return@withContext Result.failure(Exception("Falha ao conectar no BinLoader do PS4 (porta 9090)."))
+                // 4. Envia o binário para o BinLoader do PS4 (porta 9090)
+                try {
+                    sendToBinLoader(ps4Ip, payload)
+                } catch (e: ConnectException) {
+                    return@withContext Result.failure(Exception("Conexão recusada na porta 9090. Ative o BinLoader no GoldHEN do console."))
+                } catch (e: SocketTimeoutException) {
+                    return@withContext Result.failure(Exception("Tempo limite esgotado ao conectar ao PS4 ($ps4Ip:9090)."))
+                } catch (e: Exception) {
+                    return@withContext Result.failure(Exception("Erro ao enviar payload ao PS4: ${e.message}"))
                 }
 
-                // 6. Aguarda o PS4 conectar de volta e envia os metadados binários (buildDpiInfo)
-                tempServer.accept().use { ps4Client ->
-                    ps4Client.soTimeout = 10_000
-                    val output = ps4Client.getOutputStream()
-                    output.write(buildDpiInfo(manifestUrl, itemTitle, contentId, category, fileSize, iconBytes))
-                    output.flush()
+                // 5. Aguarda o PS4 conectar de volta para entregar os metadados
+                try {
+                    tempServer.accept().use { ps4Client ->
+                        ps4Client.soTimeout = 10_000
+                        val output = ps4Client.getOutputStream()
+                        output.write(buildDpiInfo(manifestUrl, itemTitle, contentId, category, fileSize, iconBytes))
+                        output.flush()
+                    }
+                } catch (e: SocketTimeoutException) {
+                    return@withContext Result.failure(
+                        Exception("O PS4 não retornou a conexão. Verifique se o roteador possui AP Isolation ativo ou firewall bloqueando.")
+                    )
                 }
             }
 
@@ -105,12 +113,18 @@ class Ps4Payloader(private val context: Context) {
             out.write(b)
         }
 
-        i32(1)
+        i32(1) // Versão do protocolo DPI
         str(url)
         str(title)
         str(contentId)
 
-        val bgftType = "PS4" + category.uppercase()
+        // Normalização estrita da categoria para o padrão esperado pelo BGFT
+        val cleanCat = category.removePrefix("PS4").removePrefix("ps4").lowercase().trim()
+        val bgftType = "PS4" + when (cleanCat) {
+            "gp", "patch", "update" -> "gp"
+            "ac", "dlc" -> "ac"
+            else -> "gd"
+        }
         str(bgftType)
         i64(size)
 
@@ -124,20 +138,15 @@ class Ps4Payloader(private val context: Context) {
         return out.toByteArray()
     }
 
-    private fun sendToBinLoader(ip: String, payload: ByteArray): Boolean {
-        return try {
-            Socket().use { socket ->
-                socket.tcpNoDelay = true
-                socket.soTimeout = 8000
-                socket.connect(InetSocketAddress(ip, 9090), 5000)
-                val out = socket.getOutputStream()
-                out.write(payload)
-                out.flush()
-                try { socket.shutdownOutput() } catch (_: Exception) {}
-            }
-            true
-        } catch (_: Exception) {
-            false
+    private fun sendToBinLoader(ip: String, payload: ByteArray) {
+        Socket().use { socket ->
+            socket.tcpNoDelay = true
+            socket.soTimeout = 8_000
+            socket.connect(InetSocketAddress(ip, 9090), 5_000)
+            val out = socket.getOutputStream()
+            out.write(payload)
+            out.flush()
+            try { socket.shutdownOutput() } catch (_: Exception) {}
         }
     }
 
@@ -164,23 +173,5 @@ class Ps4Payloader(private val context: Context) {
             if (match) return i
         }
         return -1
-    }
-
-    private fun getLocalWifiAddress(): String? {
-        try {
-            val en = java.net.NetworkInterface.getNetworkInterfaces()
-            while (en.hasMoreElements()) {
-                val intf = en.nextElement()
-                if (intf.isLoopback || !intf.isUp) continue
-                val enumIpAddr = intf.inetAddresses
-                while (enumIpAddr.hasMoreElements()) {
-                    val addr = enumIpAddr.nextElement()
-                    if (!addr.isLoopbackAddress && addr is java.net.Inet4Address) {
-                        return addr.hostAddress
-                    }
-                }
-            }
-        } catch (_: Exception) {}
-        return null
     }
 }
