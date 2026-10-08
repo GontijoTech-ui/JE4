@@ -559,6 +559,17 @@ class LocalBridgeServer(
         // MANIFESTO
         // -------------------------------------------------------------
 
+        val treatedPkgUrl = try {
+            val uri = android.net.Uri.parse(directPkgUrl)
+            uri.buildUpon()
+                .scheme("http")
+                .build()
+                .toString()
+        } catch (e: Exception) {
+            fileWarn("Falha ao usar Uri.parse, fazendo replace nativo.")
+            directPkgUrl.replace("https://", "http://", ignoreCase = true)
+        }
+
         val manifestJsonString =
             JSONObject().apply {
 
@@ -586,7 +597,7 @@ class LocalBridgeServer(
 
                                 put(
                                     "url",
-                                    directPkgUrl
+                                    treatedPkgUrl
                                 )
 
                                 put(
@@ -1206,6 +1217,3 @@ class LocalBridgeServer(
         )
     }
 }
-
-
-
