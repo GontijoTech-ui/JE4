@@ -1,12 +1,14 @@
 package com.gontijotech.gtstore.client.server
 
 import android.content.Context
+import android.util.Log
+import com.gontijotech.gtstore.client.GTStoreFileLogger
 import com.gontijotech.gtstore.client.network.Ps4Payloader
 import fi.iki.elonen.NanoHTTPD
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import java.io.ByteArrayInputStream
-import java.io.InputStream
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.URLDecoder
@@ -21,7 +23,12 @@ class LocalBridgeServer(
 ) : NanoHTTPD(port) {
 
     companion object {
+
         private const val TAG = "GTStore-Bridge"
+
+        // =============================================================
+        // PKG
+        // =============================================================
 
         private const val PKG_MAGIC = 0x7F434E54L
         private const val PKG_HEADER_SIZE = 0x1000
@@ -32,33 +39,68 @@ class LocalBridgeServer(
         private const val DIGEST_OFFSET = 0xFE0
         private const val DIGEST_LENGTH = 32
 
+        // =============================================================
+        // DIAGNÓSTICO
+        // =============================================================
+
         private const val MAX_HTML_LOG = 2500
         private const val MAX_TEXT_PREVIEW = 512
 
         private const val USER_AGENT = "PlayStation 4"
     }
 
+    // =============================================================
+    // HTTP CLIENT — PROXY NORMAL
+    // =============================================================
+
     private val proxyClient: OkHttpClient =
         OkHttpClient.Builder()
-            .connectTimeout(12, TimeUnit.SECONDS)
-            .readTimeout(35, TimeUnit.SECONDS)
-            .writeTimeout(35, TimeUnit.SECONDS)
+            .connectTimeout(
+                12,
+                TimeUnit.SECONDS
+            )
+            .readTimeout(
+                35,
+                TimeUnit.SECONDS
+            )
+            .writeTimeout(
+                35,
+                TimeUnit.SECONDS
+            )
             .followRedirects(true)
             .followSslRedirects(true)
             .retryOnConnectionFailure(true)
             .build()
+
+    // =============================================================
+    // HTTP CLIENT — STREAM DO PKG
+    // =============================================================
 
     private val streamClient: OkHttpClient =
         OkHttpClient.Builder()
-            .connectTimeout(15, TimeUnit.SECONDS)
-            .readTimeout(0, TimeUnit.MILLISECONDS)
-            .writeTimeout(0, TimeUnit.MILLISECONDS)
+            .connectTimeout(
+                15,
+                TimeUnit.SECONDS
+            )
+            .readTimeout(
+                0,
+                TimeUnit.MILLISECONDS
+            )
+            .writeTimeout(
+                0,
+                TimeUnit.MILLISECONDS
+            )
             .followRedirects(true)
             .followSslRedirects(true)
             .retryOnConnectionFailure(true)
             .build()
 
-    private val payloader = Ps4Payloader(context)
+    private val payloader =
+        Ps4Payloader(context)
+
+    // =============================================================
+    // CACHE
+    // =============================================================
 
     private val manifestCache =
         ConcurrentHashMap<String, String>()
@@ -69,38 +111,94 @@ class LocalBridgeServer(
     @Volatile
     private var lastContentId: String? = null
 
-    private fun log(message: String) {
-        android.util.Log.d(TAG, message)
+    // =============================================================
+    // LOG
+    // =============================================================
+
+    private fun log(
+        message: String
+    ) {
+
+        Log.d(
+            TAG,
+            message
+        )
+
         try {
-            GTStoreFileLogger.log("[$TAG] $message")
+
+            GTStoreFileLogger.log(
+                context,
+                TAG,
+                message
+            )
+
+        } catch (_: Exception) {
+            // Logger nunca deve derrubar o servidor.
+        }
+    }
+
+    private fun logWarn(
+        message: String
+    ) {
+
+        Log.w(
+            TAG,
+            message
+        )
+
+        try {
+
+            GTStoreFileLogger.log(
+                context,
+                TAG,
+                "WARN: $message"
+            )
+
         } catch (_: Exception) {
         }
     }
 
-    private fun logWarn(message: String) {
-        android.util.Log.w(TAG, message)
+    private fun logError(
+        message: String
+    ) {
+
+        Log.e(
+            TAG,
+            message
+        )
+
         try {
-            GTStoreFileLogger.log("[$TAG][WARN] $message")
+
+            GTStoreFileLogger.log(
+                context,
+                TAG,
+                "ERROR: $message"
+            )
+
         } catch (_: Exception) {
         }
     }
 
-    private fun logError(message: String) {
-        android.util.Log.e(TAG, message)
-        try {
-            GTStoreFileLogger.log("[$TAG][ERROR] $message")
-        } catch (_: Exception) {
-        }
-    }
+    // =============================================================
+    // SERVE
+    // =============================================================
 
-    override fun serve(session: IHTTPSession): Response {
+    override fun serve(
+        session: IHTTPSession
+    ): Response {
 
         return try {
 
             addCorsHeaders(
+
                 when (session.method) {
 
+                    // =================================================
+                    // OPTIONS
+                    // =================================================
+
                     Method.OPTIONS -> {
+
                         newFixedLengthResponse(
                             Response.Status.OK,
                             "text/plain; charset=utf-8",
@@ -108,43 +206,94 @@ class LocalBridgeServer(
                         )
                     }
 
-                    Method.POST -> {
-                        when {
-                            session.uri == "/api/local/inject" ->
-                                handleLocalInject(session)
+                    // =================================================
+                    // POST
+                    // =================================================
 
-                            else ->
-                                proxyAdmin(session)
+                    Method.POST -> {
+
+                        when {
+
+                            session.uri ==
+                                    "/api/local/inject" -> {
+
+                                handleLocalInject(
+                                    session
+                                )
+                            }
+
+                            else -> {
+
+                                proxyAdmin(
+                                    session
+                                )
+                            }
                         }
                     }
+
+                    // =================================================
+                    // GET
+                    // =================================================
 
                     Method.GET -> {
-                        when {
-                            session.uri.startsWith("/manifest/") ||
-                                    session.uri == "/local-manifest.json" ->
-                                handleServeLocalManifest(session)
 
-                            session.uri.startsWith("/download-pkg/") ->
-                                handleProxyPkg(session)
+                        when {
+
+                            session.uri.startsWith(
+                                "/manifest/"
+                            ) ||
+                                    session.uri ==
+                                    "/local-manifest.json" -> {
+
+                                handleServeLocalManifest(
+                                    session
+                                )
+                            }
+
+                            session.uri.startsWith(
+                                "/download-pkg/"
+                            ) -> {
+
+                                handleProxyPkg(
+                                    session
+                                )
+                            }
 
                             session.uri == "/" ||
-                                    session.uri == "/index.html" ->
-                                proxyAdmin(session)
+                                    session.uri == "/index.html" -> {
 
-                            else ->
-                                proxyAdmin(session)
+                                proxyAdmin(
+                                    session
+                                )
+                            }
+
+                            else -> {
+
+                                proxyAdmin(
+                                    session
+                                )
+                            }
                         }
                     }
 
-                    else ->
-                        proxyAdmin(session)
+                    // =================================================
+                    // OUTROS
+                    // =================================================
+
+                    else -> {
+
+                        proxyAdmin(
+                            session
+                        )
+                    }
                 }
             )
 
         } catch (e: Exception) {
 
             logError(
-                "Erro geral no serve(): ${e.javaClass.simpleName}: ${e.message}"
+                "Erro geral no serve(): " +
+                        "${e.javaClass.simpleName}: ${e.message}"
             )
 
             newFixedLengthResponse(
@@ -153,26 +302,49 @@ class LocalBridgeServer(
                 """
                 {
                   "success": false,
-                  "error": "${jsonEscape(e.message ?: "Erro interno")}"
+                  "error": "${jsonEscape(
+                    e.message ?: "Erro interno"
+                )}"
                 }
                 """.trimIndent()
             )
         }
     }
 
-    private fun addCorsHeaders(response: Response): Response {
-        response.addHeader("Access-Control-Allow-Origin", "*")
+    // =============================================================
+    // CORS
+    // =============================================================
+
+    private fun addCorsHeaders(
+        response: Response
+    ): Response {
+
+        response.addHeader(
+            "Access-Control-Allow-Origin",
+            "*"
+        )
+
         response.addHeader(
             "Access-Control-Allow-Methods",
             "GET, POST, OPTIONS"
         )
+
         response.addHeader(
             "Access-Control-Allow-Headers",
             "Content-Type, Range, Accept, Origin, User-Agent"
         )
-        response.addHeader("Access-Control-Expose-Headers", "*")
+
+        response.addHeader(
+            "Access-Control-Expose-Headers",
+            "*"
+        )
+
         return response
     }
+
+    // =============================================================
+    // LOCAL INJECT
+    // =============================================================
 
     private fun handleLocalInject(
         session: IHTTPSession
@@ -180,22 +352,43 @@ class LocalBridgeServer(
 
         return try {
 
-            val body = readRequestBody(session)
+            val body =
+                readRequestBody(
+                    session
+                )
 
-            log("POST /api/local/inject")
-            log("Body recebido: ${body.take(2000)}")
+            log(
+                "POST /api/local/inject"
+            )
 
-            val json = org.json.JSONObject(body)
+            log(
+                "Body recebido: ${body.take(2000)}"
+            )
+
+            val json =
+                org.json.JSONObject(
+                    body
+                )
+
+            // =========================================================
+            // PS4 IP
+            // =========================================================
 
             val ps4Ip =
-                json.optString("ps4Ip")
-                    .trim()
+                json.optString(
+                    "ps4Ip"
+                ).trim()
 
             if (ps4Ip.isBlank()) {
+
                 return jsonError(
                     "IP do PS4 não informado"
                 )
             }
+
+            // =========================================================
+            // TÍTULO
+            // =========================================================
 
             val title =
                 json.optString(
@@ -205,6 +398,10 @@ class LocalBridgeServer(
                     "Jogo PS4"
                 }
 
+            // =========================================================
+            // CATEGORIA
+            // =========================================================
+
             val category =
                 json.optString(
                     "category",
@@ -213,60 +410,139 @@ class LocalBridgeServer(
                     "gd"
                 }
 
+            /*
+             * O Ps4Payloader já possui a normalização:
+             *
+             * GD  -> PS4GD
+             * GP  -> PS4GP
+             * AC  -> PS4AC
+             *
+             * Portanto usamos PS4GD como padrão aqui.
+             */
             val categoryBgft =
-                when (category.lowercase()) {
-                    "bgft",
-                    "ps4bgft" -> "PS4BGFT"
+                when (
+                    category
+                        .trim()
+                        .lowercase()
+                ) {
 
-                    else -> "PS4GD"
+                    "gp",
+                    "patch",
+                    "update",
+                    "ps4gp" ->
+                        "PS4GP"
+
+                    "ac",
+                    "dlc",
+                    "ps4ac" ->
+                        "PS4AC"
+
+                    else ->
+                        "PS4GD"
                 }
+
+            // =========================================================
+            // URL DO PKG
+            // =========================================================
 
             val directPkgUrl =
                 firstNonBlank(
-                    json.optString("packageUrl"),
-                    json.optString("pkgUrl"),
-                    json.optString("url"),
-                    json.optString("directUrl")
+                    json.optString(
+                        "packageUrl"
+                    ),
+                    json.optString(
+                        "pkgUrl"
+                    ),
+                    json.optString(
+                        "url"
+                    ),
+                    json.optString(
+                        "directUrl"
+                    )
                 )
 
             if (directPkgUrl.isBlank()) {
+
                 return jsonError(
                     "URL direta do PKG não informada"
                 )
             }
 
+            // =========================================================
+            // CONTENT ID INICIAL
+            // =========================================================
+
             var detectedContentId =
                 firstNonBlank(
-                    json.optString("contentId"),
-                    json.optString("content_id"),
-                    json.optString("cusa"),
-                    json.optString("id")
+                    json.optString(
+                        "contentId"
+                    ),
+                    json.optString(
+                        "content_id"
+                    ),
+                    json.optString(
+                        "cusa"
+                    ),
+                    json.optString(
+                        "id"
+                    )
                 )
 
-            var realFileSize =
-                json.optLong("size", 0L)
+            // =========================================================
+            // TAMANHO INICIAL
+            // =========================================================
 
+            var realFileSize =
+                json.optLong(
+                    "size",
+                    0L
+                )
+
+            /*
+             * Digest inicial.
+             *
+             * Se a URL remota for um PKG válido,
+             * será substituído pelo digest extraído.
+             */
             var realDigest =
                 "0".repeat(64)
 
-            log("========== INÍCIO INJECT ==========")
-            log("PS4 IP: $ps4Ip")
-            log("Título: $title")
-            log("Categoria: $category")
-            log("Categoria BGFT: $categoryBgft")
-            log("URL recebida: $directPkgUrl")
-            log("Content-ID inicial: $detectedContentId")
-            log("Tamanho inicial: $realFileSize")
+            log(
+                "========== INÍCIO INJECT =========="
+            )
 
-            /*
-             * IMPORTANTE:
-             *
-             * A URL recebida pode ser uma página HTML, uma página
-             * intermediária, Cloudflare, login ou outro conteúdo.
-             *
-             * Só podemos substituir o Content-ID quando o conteúdo
-             * remoto tiver realmente o cabeçalho PKG válido.
-             */
+            log(
+                "PS4 IP: $ps4Ip"
+            )
+
+            log(
+                "Título: $title"
+            )
+
+            log(
+                "Categoria original: $category"
+            )
+
+            log(
+                "Categoria normalizada: $categoryBgft"
+            )
+
+            log(
+                "URL recebida: $directPkgUrl"
+            )
+
+            log(
+                "Content-ID inicial: [$detectedContentId]"
+            )
+
+            log(
+                "Tamanho inicial: $realFileSize"
+            )
+
+            // =========================================================
+            // INSPEÇÃO REMOTA
+            // =========================================================
+
             val remoteMeta =
                 inspectRemotePackage(
                     directPkgUrl = directPkgUrl,
@@ -275,47 +551,105 @@ class LocalBridgeServer(
 
             if (remoteMeta.validPkg) {
 
-                if (isValidContentId(remoteMeta.contentId)) {
+                log(
+                    "Resposta remota confirmou PKG válido."
+                )
+
+                // -----------------------------------------------------
+                // CONTENT ID
+                // -----------------------------------------------------
+
+                if (
+                    isValidContentId(
+                        remoteMeta.contentId
+                    )
+                ) {
+
                     detectedContentId =
                         remoteMeta.contentId
 
                     log(
-                        "Content-ID substituído pelo Content-ID real do PKG: " +
+                        "Content-ID substituído pelo Content-ID real: " +
                                 detectedContentId
                     )
+
                 } else {
+
                     logWarn(
-                        "PKG válido, mas Content-ID extraído é inválido: " +
+                        "PKG válido, mas Content-ID extraído inválido: " +
                                 remoteMeta.contentId
                     )
                 }
 
-                if (remoteMeta.size > 0L) {
+                // -----------------------------------------------------
+                // TAMANHO
+                // -----------------------------------------------------
+
+                if (
+                    remoteMeta.size > 0L
+                ) {
+
                     realFileSize =
                         remoteMeta.size
+
+                    log(
+                        "Tamanho atualizado pelo servidor remoto: " +
+                                realFileSize
+                    )
                 }
 
-                if (remoteMeta.digest.isNotBlank()) {
+                // -----------------------------------------------------
+                // DIGEST
+                // -----------------------------------------------------
+
+                if (
+                    remoteMeta.digest.isNotBlank()
+                ) {
+
                     realDigest =
                         remoteMeta.digest
+
+                    log(
+                        "Digest atualizado pelo PKG remoto: " +
+                                realDigest
+                    )
                 }
 
             } else {
 
+                /*
+                 * MUITO IMPORTANTE:
+                 *
+                 * Se a URL retornou HTML, Cloudflare,
+                 * página intermediária etc., NÃO usamos os
+                 * bytes como se fossem um PKG.
+                 *
+                 * Nesse caso preservamos o Content-ID
+                 * fornecido originalmente pela interface.
+                 */
+
                 logWarn(
-                    "Resposta remota NÃO é um PKG válido. " +
-                            "Content-ID informado pela interface será preservado."
+                    "Resposta remota NÃO é um PKG válido."
+                )
+
+                logWarn(
+                    "Content-ID fornecido pela interface será preservado."
                 )
             }
 
-            /*
-             * Se o ID recebido pela interface também for inválido,
-             * não podemos montar uma rota segura para manifesto.
-             */
-            if (!isValidContentId(detectedContentId)) {
+            // =========================================================
+            // VALIDA CONTENT ID FINAL
+            // =========================================================
+
+            if (
+                !isValidContentId(
+                    detectedContentId
+                )
+            ) {
 
                 logError(
-                    "Content-ID final inválido: [$detectedContentId]"
+                    "Content-ID FINAL inválido: " +
+                            "[$detectedContentId]"
                 )
 
                 return jsonError(
@@ -326,32 +660,51 @@ class LocalBridgeServer(
             val finalContentId =
                 detectedContentId.trim()
 
-            /*
-             * Descobre o IP local do Android.
-             */
+            // =========================================================
+            // IP LOCAL DO ANDROID
+            // =========================================================
+
             val localIp =
                 getLocalWifiAddress()
 
             if (localIp.isBlank()) {
+
+                logError(
+                    "Não foi possível determinar o IP Wi-Fi do Android."
+                )
 
                 return jsonError(
                     "Não foi possível determinar o IP Wi-Fi do Android"
                 )
             }
 
-            /*
-             * Guarda o URL real associado ao Content-ID.
-             */
-            pkgUrlCache[finalContentId] =
+            log(
+                "IP local do Android: $localIp"
+            )
+
+            // =========================================================
+            // CACHE DA URL REMOTA
+            // =========================================================
+
+            pkgUrlCache[
+                finalContentId
+            ] =
                 directPkgUrl
+
+            // =========================================================
+            // URL LOCAL DO PKG
+            // =========================================================
 
             val localPkgUrl =
                 "http://$localIp:$listeningPort/download-pkg/" +
-                        encodePathSegment(finalContentId)
+                        encodePathSegment(
+                            finalContentId
+                        )
 
-            /*
-             * Manifesto que será solicitado pelo PS4.
-             */
+            // =========================================================
+            // MANIFEST
+            // =========================================================
+
             val manifestJson =
                 buildManifestJson(
                     contentId = finalContentId,
@@ -362,56 +715,162 @@ class LocalBridgeServer(
                     packageUrl = localPkgUrl
                 )
 
-            manifestCache[finalContentId] =
+            manifestCache[
+                finalContentId
+            ] =
                 manifestJson
 
             lastContentId =
                 finalContentId
 
+            // =========================================================
+            // URL LOCAL DO MANIFEST
+            // =========================================================
+
             val localManifestUrl =
                 "http://$localIp:$listeningPort/manifest/" +
-                        encodePathSegment(finalContentId) +
+                        encodePathSegment(
+                            finalContentId
+                        ) +
                         ".json"
 
-            log("Content-ID FINAL: $finalContentId")
-            log("Tamanho FINAL: $realFileSize")
-            log("Digest FINAL: $realDigest")
-            log("URL local do PKG: $localPkgUrl")
-            log("URL local do manifesto: $localManifestUrl")
-
-            /*
-             * Injeta o payload no BinLoader do PS4.
-             */
             log(
-                "Iniciando injeção do payload em " +
-                        "$ps4Ip:9090"
+                "========================================"
             )
 
-            val injectionResult =
-                payloader.injectDpiPayload(
-                    ps4Ip = ps4Ip,
-                    packageUrl = localManifestUrl,
-                    title = title,
-                    contentId = finalContentId,
-                    category = categoryBgft,
-                    size = realFileSize,
-                    digest = realDigest
-                )
+            log(
+                "DADOS FINAIS DO ITEM"
+            )
 
-            if (!injectionResult.success) {
+            log(
+                "Content-ID: $finalContentId"
+            )
+
+            log(
+                "Título: $title"
+            )
+
+            log(
+                "Categoria: $categoryBgft"
+            )
+
+            log(
+                "Tamanho: $realFileSize"
+            )
+
+            log(
+                "Digest: $realDigest"
+            )
+
+            log(
+                "URL remota: $directPkgUrl"
+            )
+
+            log(
+                "URL local PKG: $localPkgUrl"
+            )
+
+            log(
+                "URL local manifesto: $localManifestUrl"
+            )
+
+            log(
+                "========================================"
+            )
+
+            // =========================================================
+            // INJEÇÃO
+            // =========================================================
+
+            log(
+                "Iniciando injeção do payload."
+            )
+
+            log(
+                "Destino: $ps4Ip:9090"
+            )
+
+            /*
+             * Ps4Payloader.injectDpiPayload() é suspend.
+             *
+             * NanoHTTPD não possui serve() suspend.
+             *
+             * Portanto usamos runBlocking em uma thread IO
+             * dedicada para esta operação.
+             *
+             * O próprio Ps4Payloader também usa Dispatchers.IO
+             * internamente.
+             */
+            val injectionResult: Result<Boolean> =
+                runBlocking(
+                    Dispatchers.IO
+                ) {
+
+                    payloader.injectDpiPayload(
+                        ps4Ip = ps4Ip,
+                        localIp = localIp,
+                        manifestUrl = localManifestUrl,
+                        itemTitle = title,
+                        contentId = finalContentId,
+                        category = categoryBgft,
+                        fileSize = realFileSize,
+                        iconBytes = null
+                    )
+                }
+
+            // =========================================================
+            // RESULTADO
+            // =========================================================
+
+            if (
+                injectionResult.isFailure
+            ) {
+
+                val error =
+                    injectionResult
+                        .exceptionOrNull()
+                        ?.message
+                        ?: "Falha ao injetar payload"
 
                 logError(
-                    "Falha na injeção: ${injectionResult.error}"
+                    "Falha na injeção: $error"
                 )
 
                 return jsonError(
-                    injectionResult.error
-                        ?: "Falha ao injetar payload"
+                    error
                 )
             }
 
-            log("Payload injetado com sucesso")
-            log("========== FIM INJECT ==========")
+            val injectionSuccess =
+                injectionResult.getOrNull()
+                    ?: false
+
+            if (!injectionSuccess) {
+
+                logError(
+                    "Ps4Payloader retornou Result.success(false)."
+                )
+
+                return jsonError(
+                    "O payload não confirmou a execução"
+                )
+            }
+
+            // =========================================================
+            // SUCESSO
+            // =========================================================
+
+            log(
+                "Payload injetado com sucesso."
+            )
+
+            log(
+                "PS4 recebeu o payload e confirmou callback."
+            )
+
+            log(
+                "========== FIM INJECT =========="
+            )
 
             newFixedLengthResponse(
                 Response.Status.OK,
@@ -432,22 +891,33 @@ class LocalBridgeServer(
         } catch (e: Exception) {
 
             logError(
-                "handleLocalInject: ${e.javaClass.simpleName}: ${e.message}"
+                "handleLocalInject: " +
+                        "${e.javaClass.simpleName}: ${e.message}"
             )
 
             jsonError(
-                e.message ?: "Erro ao processar injeção"
+                e.message
+                    ?: "Erro ao processar injeção"
             )
         }
     }
+
+    // =============================================================
+    // INSPEÇÃO DO PKG REMOTO
+    // =============================================================
 
     private fun inspectRemotePackage(
         directPkgUrl: String,
         initialContentId: String
     ): RemotePkgMetadata {
 
-        log("========== INSPEÇÃO REMOTA ==========")
-        log("URL original: $directPkgUrl")
+        log(
+            "========== INSPEÇÃO REMOTA =========="
+        )
+
+        log(
+            "URL original: $directPkgUrl"
+        )
 
         return try {
 
@@ -473,7 +943,8 @@ class LocalBridgeServer(
                     )
                     .build()
 
-            proxyClient.newCall(request)
+            proxyClient
+                .newCall(request)
                 .execute()
                 .use { response ->
 
@@ -481,23 +952,29 @@ class LocalBridgeServer(
                         response.body
 
                     val contentType =
-                        response.header("Content-Type")
-                            ?: ""
+                        response.header(
+                            "Content-Type"
+                        ) ?: ""
 
                     val contentLength =
-                        response.header("Content-Length")
-                            ?: ""
+                        response.header(
+                            "Content-Length"
+                        ) ?: ""
 
                     val contentRange =
-                        response.header("Content-Range")
-                            ?: ""
+                        response.header(
+                            "Content-Range"
+                        ) ?: ""
 
                     val location =
-                        response.header("Location")
-                            ?: ""
+                        response.header(
+                            "Location"
+                        ) ?: ""
 
                     val finalUrl =
-                        response.request.url.toString()
+                        response.request
+                            .url
+                            .toString()
 
                     log(
                         "HTTP code: ${response.code}"
@@ -524,6 +1001,7 @@ class LocalBridgeServer(
                     )
 
                     if (location.isNotBlank()) {
+
                         log(
                             "Location: $location"
                         )
@@ -536,7 +1014,7 @@ class LocalBridgeServer(
                     if (responseBody == null) {
 
                         logError(
-                            "Resposta remota sem body"
+                            "Resposta remota sem body."
                         )
 
                         return@use RemotePkgMetadata.invalid(
@@ -544,23 +1022,32 @@ class LocalBridgeServer(
                         )
                     }
 
+                    // =================================================
+                    // LÊ HEADER
+                    // =================================================
+
                     val input =
                         responseBody.byteStream()
 
                     val header =
-                        ByteArray(PKG_HEADER_SIZE)
+                        ByteArray(
+                            PKG_HEADER_SIZE
+                        )
 
-                    var totalRead = 0
+                    var totalRead =
+                        0
 
                     while (
-                        totalRead < PKG_HEADER_SIZE
+                        totalRead <
+                        PKG_HEADER_SIZE
                     ) {
 
                         val read =
                             input.read(
                                 header,
                                 totalRead,
-                                PKG_HEADER_SIZE - totalRead
+                                PKG_HEADER_SIZE -
+                                        totalRead
                             )
 
                         if (read <= 0) {
@@ -579,6 +1066,10 @@ class LocalBridgeServer(
                         "Bytes lidos para inspeção: $totalRead"
                     )
 
+                    // =================================================
+                    // HEX
+                    // =================================================
+
                     if (totalRead > 0) {
 
                         val hexCount =
@@ -594,6 +1085,7 @@ class LocalBridgeServer(
                                     hexCount
                                 )
                                 .joinToString(" ") {
+
                                     "%02X".format(
                                         it.toInt() and 0xFF
                                     )
@@ -602,6 +1094,10 @@ class LocalBridgeServer(
                         log(
                             "Primeiros $hexCount bytes HEX: $hex"
                         )
+
+                        // =============================================
+                        // TEXTO
+                        // =============================================
 
                         val previewCount =
                             minOf(
@@ -622,14 +1118,20 @@ class LocalBridgeServer(
                         )
                     }
 
+                    // =================================================
+                    // HTML
+                    // =================================================
+
+                    val lowerContentType =
+                        contentType.lowercase()
+
                     if (
-                        contentType
-                            .lowercase()
-                            .contains("text/html")
-                        ||
-                        contentType
-                            .lowercase()
-                            .contains("application/xhtml")
+                        lowerContentType.contains(
+                            "text/html"
+                        ) ||
+                        lowerContentType.contains(
+                            "application/xhtml"
+                        )
                     ) {
 
                         logWarn(
@@ -642,10 +1144,15 @@ class LocalBridgeServer(
                         )
                     }
 
+                    // =================================================
+                    // TAMANHO MÍNIMO
+                    // =================================================
+
                     if (totalRead < 4) {
 
                         logError(
-                            "Resposta remota pequena demais para validar PKG"
+                            "Resposta remota pequena demais " +
+                                    "para validar PKG."
                         )
 
                         return@use RemotePkgMetadata.invalid(
@@ -653,19 +1160,35 @@ class LocalBridgeServer(
                         )
                     }
 
+                    // =================================================
+                    // MAGIC
+                    // =================================================
+
                     val magic =
-                        readUInt32BE(header, 0)
+                        readUInt32BE(
+                            header,
+                            0
+                        )
 
                     log(
                         "PKG magic detectado: " +
-                                "0x${magic.toString(16).uppercase()}"
+                                "0x${
+                                    magic
+                                        .toString(16)
+                                        .uppercase()
+                                }"
                     )
 
-                    if (magic != PKG_MAGIC) {
+                    if (
+                        magic != PKG_MAGIC
+                    ) {
 
                         logWarn(
-                            "MAGIC PKG INVÁLIDO. " +
-                                    "Resposta remota não parece ser um PKG."
+                            "MAGIC PKG INVÁLIDO."
+                        )
+
+                        logWarn(
+                            "Resposta remota não parece ser um PKG."
                         )
 
                         return@use RemotePkgMetadata.invalid(
@@ -673,7 +1196,14 @@ class LocalBridgeServer(
                         )
                     }
 
-                    if (totalRead < PKG_HEADER_SIZE) {
+                    // =================================================
+                    // HEADER COMPLETO
+                    // =================================================
+
+                    if (
+                        totalRead <
+                        PKG_HEADER_SIZE
+                    ) {
 
                         logWarn(
                             "Magic válido, mas header possui apenas " +
@@ -684,6 +1214,10 @@ class LocalBridgeServer(
                             initialContentId
                         )
                     }
+
+                    // =================================================
+                    // CONTENT ID
+                    // =================================================
 
                     val extractedContentId =
                         String(
@@ -717,14 +1251,20 @@ class LocalBridgeServer(
                         )
                     }
 
+                    // =================================================
+                    // DIGEST
+                    // =================================================
+
                     val digestBytes =
                         header.copyOfRange(
                             DIGEST_OFFSET,
-                            DIGEST_OFFSET + DIGEST_LENGTH
+                            DIGEST_OFFSET +
+                                    DIGEST_LENGTH
                         )
 
                     val digest =
                         digestBytes.joinToString("") {
+
                             "%02X".format(
                                 it.toInt() and 0xFF
                             )
@@ -733,6 +1273,10 @@ class LocalBridgeServer(
                     log(
                         "Digest PKG: $digest"
                     )
+
+                    // =================================================
+                    // TAMANHO
+                    // =================================================
 
                     val remoteSize =
                         extractTotalSize(
@@ -760,7 +1304,8 @@ class LocalBridgeServer(
 
             logError(
                 "Falha na inspeção remota: " +
-                        "${e.javaClass.simpleName}: ${e.message}"
+                        "${e.javaClass.simpleName}: " +
+                        "${e.message}"
             )
 
             RemotePkgMetadata.invalid(
@@ -769,9 +1314,15 @@ class LocalBridgeServer(
 
         } finally {
 
-            log("========== FIM INSPEÇÃO REMOTA ==========")
+            log(
+                "========== FIM INSPEÇÃO REMOTA =========="
+            )
         }
     }
+
+    // =============================================================
+    // DIAGNÓSTICO HTML
+    // =============================================================
 
     private fun logHtmlDiagnostics(
         bytes: ByteArray,
@@ -797,7 +1348,8 @@ class LocalBridgeServer(
             )
 
         logWarn(
-            "HTML REMOTO — primeiros $sampleSize bytes:\n$html"
+            "HTML REMOTO — primeiros " +
+                    "$sampleSize bytes:\n$html"
         )
 
         val lower =
@@ -819,9 +1371,15 @@ class LocalBridgeServer(
                 "attention required"
             )
 
-        for (keyword in keywords) {
+        for (
+            keyword in keywords
+        ) {
 
-            if (lower.contains(keyword)) {
+            if (
+                lower.contains(
+                    keyword
+                )
+            ) {
 
                 logWarn(
                     "HTML contém indicador: [$keyword]"
@@ -829,6 +1387,10 @@ class LocalBridgeServer(
             }
         }
     }
+
+    // =============================================================
+    // MANIFEST
+    // =============================================================
 
     private fun handleServeLocalManifest(
         session: IHTTPSession
@@ -846,7 +1408,12 @@ class LocalBridgeServer(
                         ""
                     )
 
-            if (idFromPath.endsWith(".json")) {
+            if (
+                idFromPath.endsWith(
+                    ".json"
+                )
+            ) {
+
                 idFromPath =
                     idFromPath.removeSuffix(
                         ".json"
@@ -859,21 +1426,32 @@ class LocalBridgeServer(
                 )
 
             val queryId =
-                session.parameters["id"]
+                session.parameters[
+                    "id"
+                ]
                     ?.firstOrNull()
                     ?.let {
-                        decodePathSegment(it)
+                        decodePathSegment(
+                            it
+                        )
                     }
 
             val requestId =
                 when {
-                    isValidContentId(idFromPath) ->
+
+                    isValidContentId(
+                        idFromPath
+                    ) ->
                         idFromPath
 
-                    isValidContentId(queryId) ->
+                    isValidContentId(
+                        queryId
+                    ) ->
                         queryId
 
-                    isValidContentId(lastContentId) ->
+                    isValidContentId(
+                        lastContentId
+                    ) ->
                         lastContentId!!
 
                     else ->
@@ -896,10 +1474,12 @@ class LocalBridgeServer(
                 "ID final solicitado: [$requestId]"
             )
 
-            if (requestId.isNullOrBlank()) {
+            if (
+                requestId.isNullOrBlank()
+            ) {
 
                 logWarn(
-                    "Manifesto solicitado sem Content-ID válido"
+                    "Manifesto solicitado sem Content-ID válido."
                 )
 
                 return newFixedLengthResponse(
@@ -915,17 +1495,23 @@ class LocalBridgeServer(
             }
 
             val manifest =
-                manifestCache[requestId]
+                manifestCache[
+                    requestId
+                ]
 
-            if (manifest == null) {
+            if (
+                manifest == null
+            ) {
 
                 logWarn(
-                    "Manifesto inexistente para o Content-ID: $requestId"
+                    "Manifesto inexistente para o Content-ID: " +
+                            requestId
                 )
 
                 log(
                     "Manifestos atualmente em cache: " +
-                            manifestCache.keys.joinToString(", ")
+                            manifestCache.keys
+                                .joinToString(", ")
                 )
 
                 return newFixedLengthResponse(
@@ -935,7 +1521,9 @@ class LocalBridgeServer(
                     {
                       "success": false,
                       "error": "Manifesto inexistente",
-                      "contentId": "${jsonEscape(requestId)}"
+                      "contentId": "${jsonEscape(
+                        requestId
+                    )}"
                     }
                     """.trimIndent()
                 )
@@ -950,6 +1538,7 @@ class LocalBridgeServer(
                 "application/json; charset=utf-8",
                 manifest
             ).apply {
+
                 addHeader(
                     "Cache-Control",
                     "no-cache, no-store, must-revalidate"
@@ -960,7 +1549,8 @@ class LocalBridgeServer(
 
             logError(
                 "handleServeLocalManifest: " +
-                        "${e.javaClass.simpleName}: ${e.message}"
+                        "${e.javaClass.simpleName}: " +
+                        "${e.message}"
             )
 
             newFixedLengthResponse(
@@ -970,6 +1560,10 @@ class LocalBridgeServer(
             )
         }
     }
+
+    // =============================================================
+    // PROXY PKG
+    // =============================================================
 
     private fun handleProxyPkg(
         session: IHTTPSession
@@ -991,10 +1585,15 @@ class LocalBridgeServer(
                     contentId
                 )
 
-            if (!isValidContentId(contentId)) {
+            if (
+                !isValidContentId(
+                    contentId
+                )
+            ) {
 
                 logWarn(
-                    "Download solicitado com Content-ID inválido: [$contentId]"
+                    "Download solicitado com Content-ID inválido: " +
+                            "[$contentId]"
                 )
 
                 return newFixedLengthResponse(
@@ -1005,12 +1604,17 @@ class LocalBridgeServer(
             }
 
             val remoteUrl =
-                pkgUrlCache[contentId]
+                pkgUrlCache[
+                    contentId
+                ]
 
-            if (remoteUrl.isNullOrBlank()) {
+            if (
+                remoteUrl.isNullOrBlank()
+            ) {
 
                 logWarn(
-                    "Nenhuma URL remota encontrada para: $contentId"
+                    "Nenhuma URL remota encontrada para: " +
+                            contentId
                 )
 
                 return newFixedLengthResponse(
@@ -1021,8 +1625,12 @@ class LocalBridgeServer(
             }
 
             val range =
-                session.headers["range"]
-                    ?: session.headers["Range"]
+                session.headers[
+                    "range"
+                ]
+                    ?: session.headers[
+                        "Range"
+                    ]
 
             log(
                 "========== PROXY PKG =========="
@@ -1039,6 +1647,10 @@ class LocalBridgeServer(
             log(
                 "Range PS4: ${range ?: "(nenhum)"}"
             )
+
+            // =========================================================
+            // REQUEST REMOTO
+            // =========================================================
 
             val requestBuilder =
                 Request.Builder()
@@ -1057,7 +1669,10 @@ class LocalBridgeServer(
                         "identity"
                     )
 
-            if (!range.isNullOrBlank()) {
+            if (
+                !range.isNullOrBlank()
+            ) {
+
                 requestBuilder.header(
                     "Range",
                     range
@@ -1065,19 +1680,23 @@ class LocalBridgeServer(
             }
 
             val remoteResponse =
-                streamClient.newCall(
-                    requestBuilder.build()
-                ).execute()
+                streamClient
+                    .newCall(
+                        requestBuilder.build()
+                    )
+                    .execute()
 
             val responseBody =
                 remoteResponse.body
 
-            if (responseBody == null) {
+            if (
+                responseBody == null
+            ) {
 
                 remoteResponse.close()
 
                 logError(
-                    "Servidor remoto retornou body nulo"
+                    "Servidor remoto retornou body nulo."
                 )
 
                 return newFixedLengthResponse(
@@ -1103,10 +1722,14 @@ class LocalBridgeServer(
                 ) ?: ""
 
             val finalUrl =
-                remoteResponse.request.url.toString()
+                remoteResponse.request
+                    .url
+                    .toString()
 
             log(
-                "HTTP remoto: ${remoteResponse.code} ${remoteResponse.message}"
+                "HTTP remoto: " +
+                        "${remoteResponse.code} " +
+                        remoteResponse.message
             )
 
             log(
@@ -1114,29 +1737,34 @@ class LocalBridgeServer(
             )
 
             log(
-                "Content-Type remoto: $responseContentType"
+                "Content-Type remoto: " +
+                        responseContentType
             )
 
             log(
-                "Content-Range remoto: $responseContentRange"
+                "Content-Range remoto: " +
+                        responseContentRange
             )
 
             log(
-                "Content-Length remoto: $responseContentLength"
+                "Content-Length remoto: " +
+                        responseContentLength
             )
 
-            /*
-             * Se o servidor remoto devolveu HTML,
-             * não devemos encaminhá-lo para o PS4 como se fosse PKG.
-             */
+            // =========================================================
+            // HTML REMOTO
+            // =========================================================
+
+            val lowerType =
+                responseContentType.lowercase()
+
             if (
-                responseContentType
-                    .lowercase()
-                    .contains("text/html")
-                ||
-                responseContentType
-                    .lowercase()
-                    .contains("application/xhtml")
+                lowerType.contains(
+                    "text/html"
+                ) ||
+                lowerType.contains(
+                    "application/xhtml"
+                )
             ) {
 
                 val sample =
@@ -1158,19 +1786,25 @@ class LocalBridgeServer(
                         } catch (_: Exception) {
                         }
 
-                        if (count > 0) {
+                        if (
+                            count > 0
+                        ) {
+
                             sanitizeText(
                                 buffer.copyOfRange(
                                     0,
                                     count
                                 )
                             )
+
                         } else {
                             ""
                         }
 
                     } catch (e: Exception) {
-                        "Não foi possível ler amostra HTML: ${e.message}"
+
+                        "Não foi possível ler amostra HTML: " +
+                                e.message
                     }
 
                 remoteResponse.close()
@@ -1190,9 +1824,10 @@ class LocalBridgeServer(
                 )
             }
 
-            /*
-             * Mantemos o body aberto para o PS4.
-             */
+            // =========================================================
+            // STATUS
+            // =========================================================
+
             val status =
                 when {
 
@@ -1205,6 +1840,10 @@ class LocalBridgeServer(
                     else ->
                         Response.Status.INTERNAL_ERROR
                 }
+
+            // =========================================================
+            // STREAM PARA PS4
+            // =========================================================
 
             val response =
                 newChunkedResponse(
@@ -1220,7 +1859,9 @@ class LocalBridgeServer(
                 "bytes"
             )
 
-            if (responseContentRange.isNotBlank()) {
+            if (
+                responseContentRange.isNotBlank()
+            ) {
 
                 response.addHeader(
                     "Content-Range",
@@ -1228,7 +1869,9 @@ class LocalBridgeServer(
                 )
             }
 
-            if (responseContentLength.isNotBlank()) {
+            if (
+                responseContentLength.isNotBlank()
+            ) {
 
                 response.addHeader(
                     "Content-Length",
@@ -1242,7 +1885,7 @@ class LocalBridgeServer(
             )
 
             log(
-                "Proxy PKG entregue ao PS4"
+                "Proxy PKG entregue ao PS4."
             )
 
             log(
@@ -1255,16 +1898,25 @@ class LocalBridgeServer(
 
             logError(
                 "handleProxyPkg: " +
-                        "${e.javaClass.simpleName}: ${e.message}"
+                        "${e.javaClass.simpleName}: " +
+                        "${e.message}"
             )
 
             newFixedLengthResponse(
                 Response.Status.INTERNAL_ERROR,
                 "text/plain; charset=utf-8",
-                "Erro no proxy do PKG: ${e.message ?: "erro desconhecido"}"
+                "Erro no proxy do PKG: " +
+                        (
+                            e.message
+                                ?: "erro desconhecido"
+                        )
             )
         }
     }
+
+    // =============================================================
+    // PROXY ADMIN
+    // =============================================================
 
     private fun proxyAdmin(
         session: IHTTPSession
@@ -1277,8 +1929,11 @@ class LocalBridgeServer(
                     session.uri == "/" ||
                     session.uri.isBlank()
                 ) {
+
                     adminHost
+
                 } else {
+
                     adminHost.trimEnd('/') +
                             session.uri
                 }
@@ -1293,11 +1948,16 @@ class LocalBridgeServer(
                     .get()
                     .header(
                         "User-Agent",
-                        session.headers["user-agent"]
+                        session.headers[
+                            "user-agent"
+                        ]
                             ?: "GTStore-Android"
                     )
 
-            session.headers["accept"]?.let {
+            session.headers[
+                "accept"
+            ]?.let {
+
                 requestBuilder.header(
                     "Accept",
                     it
@@ -1305,14 +1965,18 @@ class LocalBridgeServer(
             }
 
             val response =
-                proxyClient.newCall(
-                    requestBuilder.build()
-                ).execute()
+                proxyClient
+                    .newCall(
+                        requestBuilder.build()
+                    )
+                    .execute()
 
             val body =
                 response.body
 
-            if (body == null) {
+            if (
+                body == null
+            ) {
 
                 response.close()
 
@@ -1326,7 +1990,8 @@ class LocalBridgeServer(
             val contentType =
                 response.header(
                     "Content-Type"
-                ) ?: "text/html; charset=utf-8"
+                )
+                    ?: "text/html; charset=utf-8"
 
             val responseBody =
                 body.byteStream()
@@ -1354,7 +2019,8 @@ class LocalBridgeServer(
 
             logError(
                 "proxyAdmin: " +
-                        "${e.javaClass.simpleName}: ${e.message}"
+                        "${e.javaClass.simpleName}: " +
+                        "${e.message}"
             )
 
             newFixedLengthResponse(
@@ -1364,6 +2030,10 @@ class LocalBridgeServer(
             )
         }
     }
+
+    // =============================================================
+    // MANIFEST JSON
+    // =============================================================
 
     private fun buildManifestJson(
         contentId: String,
@@ -1375,20 +2045,25 @@ class LocalBridgeServer(
     ): String {
 
         val safeSize =
-            originalFileSize.coerceAtLeast(0L)
+            originalFileSize.coerceAtLeast(
+                0L
+            )
 
         val safeDigest =
             if (
                 packageDigest.length == 64
             ) {
+
                 packageDigest
+
             } else {
+
                 "0".repeat(64)
             }
 
         /*
-         * hashValue permanece como zeros porque o proxy
-         * não está armazenando o PKG localmente.
+         * O proxy não armazena o PKG localmente,
+         * portanto hashValue permanece zerado.
          */
         val hashValue =
             "0".repeat(40)
@@ -1413,12 +2088,18 @@ class LocalBridgeServer(
         """.trimIndent()
     }
 
+    // =============================================================
+    // REQUEST BODY
+    // =============================================================
+
     private fun readRequestBody(
         session: IHTTPSession
     ): String {
 
         val contentLength =
-            session.headers["content-length"]
+            session.headers[
+                "content-length"
+            ]
                 ?.toIntOrNull()
                 ?: 0
 
@@ -1430,13 +2111,21 @@ class LocalBridgeServer(
         )
 
         val postData =
-            bodyMap["postData"]
+            bodyMap[
+                "postData"
+            ]
 
-        if (postData != null) {
+        if (
+            postData != null
+        ) {
+
             return postData
         }
 
-        if (contentLength <= 0) {
+        if (
+            contentLength <= 0
+        ) {
+
             return ""
         }
 
@@ -1444,9 +2133,12 @@ class LocalBridgeServer(
             session.inputStream
 
         val buffer =
-            ByteArray(contentLength)
+            ByteArray(
+                contentLength
+            )
 
-        var offset = 0
+        var offset =
+            0
 
         while (
             offset < contentLength
@@ -1456,10 +2148,13 @@ class LocalBridgeServer(
                 input.read(
                     buffer,
                     offset,
-                    contentLength - offset
+                    contentLength -
+                            offset
                 )
 
-            if (read <= 0) {
+            if (
+                read <= 0
+            ) {
                 break
             }
 
@@ -1473,6 +2168,10 @@ class LocalBridgeServer(
             StandardCharsets.UTF_8
         )
     }
+
+    // =============================================================
+    // JSON ERROR
+    // =============================================================
 
     private fun jsonError(
         message: String
@@ -1490,35 +2189,57 @@ class LocalBridgeServer(
         )
     }
 
+    // =============================================================
+    // STRING
+    // =============================================================
+
     private fun firstNonBlank(
         vararg values: String
     ): String {
 
-        return values.firstOrNull {
-            it.isNotBlank()
-        }?.trim() ?: ""
+        return values
+            .firstOrNull {
+                it.isNotBlank()
+            }
+            ?.trim()
+            ?: ""
     }
+
+    // =============================================================
+    // CONTENT ID
+    // =============================================================
 
     private fun isValidContentId(
         contentId: String?
     ): Boolean {
 
-        if (contentId.isNullOrBlank()) {
+        if (
+            contentId.isNullOrBlank()
+        ) {
             return false
         }
 
         val id =
             contentId.trim()
 
-        if (id.length != CONTENT_ID_LENGTH) {
+        if (
+            id.length !=
+            CONTENT_ID_LENGTH
+        ) {
             return false
         }
 
-        if (id.any { it.isWhitespace() }) {
+        if (
+            id.any {
+                it.isWhitespace()
+            }
+        ) {
             return false
         }
 
-        if (!id.contains("-")) {
+        if (
+            !id.contains("-")
+        ) {
             return false
         }
 
@@ -1536,6 +2257,10 @@ class LocalBridgeServer(
         }
     }
 
+    // =============================================================
+    // UINT32 BIG ENDIAN
+    // =============================================================
+
     private fun readUInt32BE(
         bytes: ByteArray,
         offset: Int
@@ -1549,18 +2274,33 @@ class LocalBridgeServer(
         }
 
         return (
-                ((bytes[offset].toInt() and 0xFF)
-                        .toLong() shl 24)
-                        or
-                        ((bytes[offset + 1].toInt() and 0xFF)
-                                .toLong() shl 16)
-                        or
-                        ((bytes[offset + 2].toInt() and 0xFF)
-                                .toLong() shl 8)
-                        or
-                        (bytes[offset + 3].toInt() and 0xFF)
+                (
+                    (bytes[offset].toInt() and 0xFF)
+                        .toLong()
+                        .shl(24)
+                    )
+                    or
+                    (
+                        (bytes[offset + 1].toInt() and 0xFF)
+                            .toLong()
+                            .shl(16)
+                        )
+                    or
+                    (
+                        (bytes[offset + 2].toInt() and 0xFF)
+                            .toLong()
+                            .shl(8)
+                        )
+                    or
+                    (
+                        bytes[offset + 3].toInt() and 0xFF
+                    )
                 )
     }
+
+    // =============================================================
+    // TAMANHO REMOTO
+    // =============================================================
 
     private fun extractTotalSize(
         contentRange: String,
@@ -1569,14 +2309,22 @@ class LocalBridgeServer(
 
         /*
          * Exemplo:
+         *
          * bytes 0-4095/1423900672
          */
-        if (contentRange.isNotBlank()) {
+
+        if (
+            contentRange.isNotBlank()
+        ) {
 
             val slash =
-                contentRange.lastIndexOf('/')
+                contentRange.lastIndexOf(
+                    '/'
+                )
 
-            if (slash >= 0) {
+            if (
+                slash >= 0
+            ) {
 
                 val total =
                     contentRange
@@ -1592,6 +2340,7 @@ class LocalBridgeServer(
                     parsed != null &&
                     parsed > 0L
                 ) {
+
                     return parsed
                 }
             }
@@ -1599,9 +2348,15 @@ class LocalBridgeServer(
 
         return contentLength
             .toLongOrNull()
-            ?.takeIf { it > 0L }
+            ?.takeIf {
+                it > 0L
+            }
             ?: 0L
     }
+
+    // =============================================================
+    // SANITIZE
+    // =============================================================
 
     private fun sanitizeText(
         bytes: ByteArray
@@ -1611,24 +2366,59 @@ class LocalBridgeServer(
             bytes,
             StandardCharsets.UTF_8
         )
-            .replace("\u0000", "")
-            .replace("\r", "")
-            .replace("\n", " ")
-            .replace(Regex("\\s+"), " ")
+            .replace(
+                "\u0000",
+                ""
+            )
+            .replace(
+                "\r",
+                ""
+            )
+            .replace(
+                "\n",
+                " "
+            )
+            .replace(
+                Regex("\\s+"),
+                " "
+            )
             .trim()
     }
+
+    // =============================================================
+    // JSON ESCAPE
+    // =============================================================
 
     private fun jsonEscape(
         value: String
     ): String {
 
         return value
-            .replace("\\", "\\\\")
-            .replace("\"", "\\\"")
-            .replace("\r", "\\r")
-            .replace("\n", "\\n")
-            .replace("\t", "\\t")
+            .replace(
+                "\\",
+                "\\\\"
+            )
+            .replace(
+                "\"",
+                "\\\""
+            )
+            .replace(
+                "\r",
+                "\\r"
+            )
+            .replace(
+                "\n",
+                "\\n"
+            )
+            .replace(
+                "\t",
+                "\\t"
+            )
     }
+
+    // =============================================================
+    // URL ENCODE
+    // =============================================================
 
     private fun encodePathSegment(
         value: String
@@ -1639,8 +2429,15 @@ class LocalBridgeServer(
                 value,
                 StandardCharsets.UTF_8.name()
             )
-            .replace("+", "%20")
+            .replace(
+                "+",
+                "%20"
+            )
     }
+
+    // =============================================================
+    // URL DECODE
+    // =============================================================
 
     private fun decodePathSegment(
         value: String
@@ -1658,6 +2455,10 @@ class LocalBridgeServer(
             value
         }
     }
+
+    // =============================================================
+    // IP LOCAL WI-FI
+    // =============================================================
 
     private fun getLocalWifiAddress(): String {
 
@@ -1702,11 +2503,18 @@ class LocalBridgeServer(
                         if (
                             host != null &&
                             (
-                                host.startsWith("192.168.") ||
-                                host.startsWith("10.") ||
-                                is172Private(host)
+                                host.startsWith(
+                                    "192.168."
+                                ) ||
+                                host.startsWith(
+                                    "10."
+                                ) ||
+                                is172Private(
+                                    host
+                                )
                             )
                         ) {
+
                             return host
                         }
                     }
@@ -1721,12 +2529,17 @@ class LocalBridgeServer(
         } catch (e: Exception) {
 
             logError(
-                "getLocalWifiAddress: ${e.message}"
+                "getLocalWifiAddress: " +
+                        e.message
             )
 
             ""
         }
     }
+
+    // =============================================================
+    // REDE 172.16.0.0/12
+    // =============================================================
 
     private fun is172Private(
         ip: String
@@ -1734,18 +2547,24 @@ class LocalBridgeServer(
 
         return try {
 
-            val firstTwo =
-                ip.split(".")
+            val parts =
+                ip.split(
+                    "."
+                )
 
-            if (firstTwo.size < 2) {
+            if (
+                parts.size < 2
+            ) {
+
                 false
+
             } else {
 
                 val first =
-                    firstTwo[0].toInt()
+                    parts[0].toInt()
 
                 val second =
-                    firstTwo[1].toInt()
+                    parts[1].toInt()
 
                 first == 172 &&
                         second in 16..31
@@ -1756,6 +2575,10 @@ class LocalBridgeServer(
             false
         }
     }
+
+    // =============================================================
+    // METADATA
+    // =============================================================
 
     private data class RemotePkgMetadata(
         val validPkg: Boolean,
