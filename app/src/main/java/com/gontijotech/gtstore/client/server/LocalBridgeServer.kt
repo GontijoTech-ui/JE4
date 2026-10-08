@@ -39,6 +39,9 @@ class LocalBridgeServer(
     private val manifestCache =
         ConcurrentHashMap<String, String>()
 
+    private val pkgUrlCache =
+        ConcurrentHashMap<String, String>()
+
     @Volatile
     private var lastContentId: String? = null
 
@@ -97,7 +100,7 @@ class LocalBridgeServer(
         val method = session.method
 
         fileLog(
-            "Requisição: $method $uri"
+            "Requisição: $method$uri"
         )
 
         if (method == Method.OPTIONS) {
@@ -131,6 +134,11 @@ class LocalBridgeServer(
                     handleServeLocalManifest(session)
                 }
 
+                method == Method.GET && uri.startsWith("/download-pkg/") -> {
+
+                    handleRedirectPkg(session)
+                }
+
                 uri == "/" ||
                     uri == "/index.html" -> {
 
@@ -150,7 +158,7 @@ class LocalBridgeServer(
         } catch (e: Exception) {
 
             fileError(
-                "Erro no processamento da rota $uri: ${e.message}",
+                "Erro no processamento da rota $uri:${e.message}",
                 e
             )
 
@@ -556,19 +564,36 @@ class LocalBridgeServer(
         }
 
         // -------------------------------------------------------------
-        // MANIFESTO
+        // IP LOCAL
         // -------------------------------------------------------------
 
-        val treatedPkgUrl = try {
-            val uri = android.net.Uri.parse(directPkgUrl)
-            uri.buildUpon()
-                .scheme("http")
-                .build()
-                .toString()
-        } catch (e: Exception) {
-            fileWarn("Falha ao usar Uri.parse, fazendo replace nativo.")
-            directPkgUrl.replace("https://", "http://", ignoreCase = true)
+        val localIp =
+            getLocalWifiAddress()
+
+        if (localIp == null) {
+
+            fileError(
+                "Não foi possível encontrar o IP Wi-Fi do Android."
+            )
+
+            return jsonError(
+                session,
+                Response.Status.BAD_REQUEST,
+                "O aparelho não está conectado ao Wi-Fi local."
+            )
         }
+
+        fileLog(
+            "IP Wi-Fi do Android: $localIp"
+        )
+
+        // -------------------------------------------------------------
+        // MANIFESTO (Com Redirect 302)
+        // -------------------------------------------------------------
+
+        pkgUrlCache[finalContentId] = directPkgUrl
+
+        val localRedirectUrl = "http://$localIp:$port/download-pkg/$finalContentId"
 
         val manifestJsonString =
             JSONObject().apply {
@@ -597,7 +622,7 @@ class LocalBridgeServer(
 
                                 put(
                                     "url",
-                                    treatedPkgUrl
+                                    localRedirectUrl
                                 )
 
                                 put(
@@ -638,30 +663,6 @@ class LocalBridgeServer(
 
         fileLog(
             "Manifesto armazenado no cache para: $finalContentId"
-        )
-
-        // -------------------------------------------------------------
-        // IP LOCAL
-        // -------------------------------------------------------------
-
-        val localIp =
-            getLocalWifiAddress()
-
-        if (localIp == null) {
-
-            fileError(
-                "Não foi possível encontrar o IP Wi-Fi do Android."
-            )
-
-            return jsonError(
-                session,
-                Response.Status.BAD_REQUEST,
-                "O aparelho não está conectado ao Wi-Fi local."
-            )
-        }
-
-        fileLog(
-            "IP Wi-Fi do Android: $localIp"
         )
 
         // -------------------------------------------------------------
@@ -878,342 +879,4 @@ class LocalBridgeServer(
                 )
             )
 
-        } else {
-
-            fileWarn(
-                "Manifesto inexistente para: $requestId"
-            )
-
-            addCors(
-                session,
-                newFixedLengthResponse(
-                    Response.Status.NOT_FOUND,
-                    "application/json",
-                    """{"error":"Manifesto ausente"}"""
-                )
-            )
-        }
-    }
-
-    /**
-     * Proxy da página principal.
-     */
-    private fun handleProxyStatic(
-        targetUrl: String,
-        mime: String,
-        session: IHTTPSession
-    ): Response {
-
-        fileLog(
-            "Carregando interface: $targetUrl"
-        )
-
-        val request =
-            Request.Builder()
-                .url(targetUrl)
-                .build()
-
-        return proxyClient
-            .newCall(request)
-            .execute()
-            .use { response ->
-
-                val body =
-                    response
-                        .body
-                        ?.string()
-                        ?: "Falha ao carregar interface remota."
-
-                fileLog(
-                    "Interface remota respondeu HTTP ${response.code}"
-                )
-
-                addCors(
-                    session,
-                    newFixedLengthResponse(
-                        Response.Status.OK,
-                        mime,
-                        body
-                    )
-                )
-            }
-    }
-
-    /**
-     * Encaminha requisições da interface para o servidor remoto.
-     */
-    private fun handleProxyForward(
-        session: IHTTPSession
-    ): Response {
-
-        val queryString =
-            if (
-                !session
-                    .queryParameterString
-                    .isNullOrBlank()
-            ) {
-
-                "?${session.queryParameterString}"
-
-            } else {
-
-                ""
-            }
-
-        val targetUrl =
-            "$adminHost${session.uri}$queryString"
-
-        fileLog(
-            "Proxy -> $targetUrl"
-        )
-
-        val requestBuilder =
-            Request.Builder()
-                .url(targetUrl)
-
-        when (session.method) {
-
-            Method.POST -> {
-
-                val map =
-                    HashMap<String, String>()
-
-                session.parseBody(map)
-
-                val bodyText =
-                    map["postData"] ?: ""
-
-                val contentType =
-                    session.headers["content-type"]
-                        ?: "application/json"
-
-                requestBuilder.post(
-                    bodyText.toRequestBody(
-                        contentType.toMediaTypeOrNull()
-                    )
-                )
-            }
-
-            Method.PUT -> {
-
-                val map =
-                    HashMap<String, String>()
-
-                session.parseBody(map)
-
-                val bodyText =
-                    map["postData"] ?: ""
-
-                val contentType =
-                    session.headers["content-type"]
-                        ?: "application/json"
-
-                requestBuilder.put(
-                    bodyText.toRequestBody(
-                        contentType.toMediaTypeOrNull()
-                    )
-                )
-            }
-
-            Method.DELETE -> {
-                requestBuilder.delete()
-            }
-
-            Method.HEAD -> {
-                requestBuilder.head()
-            }
-
-            else -> {
-                requestBuilder.get()
-            }
-        }
-
-        return proxyClient
-            .newCall(
-                requestBuilder.build()
-            )
-            .execute()
-            .use { response ->
-
-                val bytes =
-                    response
-                        .body
-                        ?.bytes()
-                        ?: ByteArray(0)
-
-                val contentType =
-                    response.header(
-                        "Content-Type"
-                    )
-                        ?: "application/octet-stream"
-
-                val status =
-                    Response.Status.lookup(
-                        response.code
-                    )
-                        ?: object : Response.IStatus {
-
-                            override fun getRequestStatus(): Int =
-                                response.code
-
-                            override fun getDescription(): String =
-                                response.message
-                        }
-
-                addCors(
-                    session,
-                    newFixedLengthResponse(
-                        status,
-                        contentType,
-                        ByteArrayInputStream(bytes),
-                        bytes.size.toLong()
-                    )
-                )
-            }
-    }
-
-    /**
-     * Descobre o IPv4 Wi-Fi do Android.
-     */
-    private fun getLocalWifiAddress(): String? {
-
-        try {
-
-            val interfaces =
-                NetworkInterface
-                    .getNetworkInterfaces()
-                    ?.toList()
-                    ?: return null
-
-            val validInterfaces =
-                interfaces.filter { networkInterface ->
-
-                    val name =
-                        networkInterface
-                            .name
-                            .lowercase()
-
-                    networkInterface.isUp &&
-                        !networkInterface.isLoopback &&
-                        !name.contains("tun") &&
-                        !name.contains("tap") &&
-                        !name.contains("rmnet") &&
-                        !name.contains("pdp") &&
-                        !name.contains("dummy")
-                }
-
-            val sorted =
-                validInterfaces.sortedByDescending {
-
-                    it.name.startsWith("wlan") ||
-                        it.name.startsWith("ap")
-                }
-
-            for (networkInterface in sorted) {
-
-                for (
-                    address in
-                    networkInterface.inetAddresses
-                ) {
-
-                    if (
-                        !address.isLoopbackAddress &&
-                        address is Inet4Address &&
-                        address.isSiteLocalAddress
-                    ) {
-
-                        val host =
-                            address.hostAddress
-
-                        fileLog(
-                            "IP Wi-Fi encontrado: $host"
-                        )
-
-                        return host
-                    }
-                }
-            }
-
-        } catch (e: Exception) {
-
-            fileError(
-                "Erro ao detectar IP Wi-Fi: ${e.message}",
-                e
-            )
-        }
-
-        return null
-    }
-
-    /**
-     * Adiciona CORS.
-     */
-    private fun addCors(
-        session: IHTTPSession,
-        response: Response
-    ): Response {
-
-        val requestedHeaders =
-            session.headers[
-                "access-control-request-headers"
-            ]
-                ?: "Content-Type, Authorization, Range, X-Requested-With"
-
-        response.addHeader(
-            "Access-Control-Allow-Origin",
-            "*"
-        )
-
-        response.addHeader(
-            "Access-Control-Allow-Methods",
-            "GET, POST, OPTIONS, PUT, DELETE"
-        )
-
-        response.addHeader(
-            "Access-Control-Allow-Headers",
-            requestedHeaders
-        )
-
-        response.addHeader(
-            "Access-Control-Max-Age",
-            "86400"
-        )
-
-        return response
-    }
-
-    /**
-     * Resposta JSON de erro.
-     */
-    private fun jsonError(
-        session: IHTTPSession,
-        status: Response.IStatus,
-        message: String
-    ): Response {
-
-        fileError(
-            "Erro HTTP ${status.requestStatus}: $message"
-        )
-
-        val json =
-            JSONObject()
-                .put(
-                    "success",
-                    false
-                )
-                .put(
-                    "error",
-                    message
-                )
-                .toString()
-
-        return addCors(
-            session,
-            newFixedLengthResponse(
-                status,
-                "application/json",
-                json
-            )
-        )
-    }
-}
+        } else
