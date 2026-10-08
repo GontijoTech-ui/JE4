@@ -2,6 +2,7 @@ package com.gontijotech.gtstore.client.network
 
 import android.content.Context
 import android.util.Log
+import com.gontijotech.gtstore.client.GTStoreFileLogger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
@@ -22,9 +23,6 @@ class Ps4Payloader(
     companion object {
         private const val TAG = "GTStore-Payload"
 
-        /**
-         * Mesmas portas utilizadas pelo projeto antigo.
-         */
         private val BINLOADER_PORTS = intArrayOf(
             9090,
             9021,
@@ -36,26 +34,52 @@ class Ps4Payloader(
     }
 
     /**
-     * Executa a injeção DPI completa:
+     * Loga simultaneamente no Logcat e em:
      *
-     * Android
-     *   ↓
-     * cria ServerSocket temporário
-     *   ↓
-     * altera payload com IP + porta do Android
-     *   ↓
-     * envia payload ao BinLoader do PS4
-     *   ↓
-     * PS4 conecta de volta ao Android
-     *   ↓
-     * Android envia buildInfo()
-     *   ↓
-     * PS4 recebe manifesto
-     *
-     * @param ps4Ip IP do PS4
-     * @param localIp IP Wi-Fi do Android
-     * @param manifestUrl URL do manifesto servido pelo Android
+     * Downloads/GTSTORE-log.txt
      */
+    private fun fileLog(message: String) {
+        Log.i(TAG, message)
+
+        GTStoreFileLogger.log(
+            context,
+            TAG,
+            message
+        )
+    }
+
+    private fun fileWarn(message: String) {
+        Log.w(TAG, message)
+
+        GTStoreFileLogger.log(
+            context,
+            TAG,
+            "WARN: $message"
+        )
+    }
+
+    private fun fileError(
+        message: String,
+        throwable: Throwable? = null
+    ) {
+        Log.e(
+            TAG,
+            message,
+            throwable
+        )
+
+        GTStoreFileLogger.log(
+            context,
+            TAG,
+            "ERROR: $message" +
+                (
+                    throwable?.message
+                        ?.let { " | $it" }
+                        ?: ""
+                )
+        )
+    }
+
     suspend fun injectDpiPayload(
         ps4Ip: String,
         localIp: String,
@@ -69,20 +93,53 @@ class Ps4Payloader(
 
         try {
 
-            Log.i(TAG, "========================================")
-            Log.i(TAG, "INÍCIO DA INJEÇÃO")
-            Log.i(TAG, "PS4       : $ps4Ip")
-            Log.i(TAG, "Android   : $localIp")
-            Log.i(TAG, "Manifesto : $manifestUrl")
-            Log.i(TAG, "Título    : $itemTitle")
-            Log.i(TAG, "ContentID : $contentId")
-            Log.i(TAG, "Categoria : $category")
-            Log.i(TAG, "Tamanho   : $fileSize")
-            Log.i(TAG, "========================================")
+            fileLog(
+                "========================================"
+            )
+
+            fileLog(
+                "INÍCIO DA INJEÇÃO"
+            )
+
+            fileLog(
+                "PS4       : $ps4Ip"
+            )
+
+            fileLog(
+                "Android   : $localIp"
+            )
+
+            fileLog(
+                "Manifesto : $manifestUrl"
+            )
+
+            fileLog(
+                "Título    : $itemTitle"
+            )
+
+            fileLog(
+                "ContentID : $contentId"
+            )
+
+            fileLog(
+                "Categoria : $category"
+            )
+
+            fileLog(
+                "Tamanho   : $fileSize"
+            )
+
+            fileLog(
+                "========================================"
+            )
 
             // ---------------------------------------------------------
-            // 1. Carrega o payload
+            // 1. CARREGA PAYLOAD
             // ---------------------------------------------------------
+
+            fileLog(
+                "Carregando payload..."
+            )
 
             val payloadTemplate =
                 loadPayload("payload.bin")
@@ -94,27 +151,41 @@ class Ps4Payloader(
                         )
                     )
 
-            Log.i(
-                TAG,
+            fileLog(
                 "Payload carregado: ${payloadTemplate.size} bytes"
             )
 
-            val payload = payloadTemplate.copyOf()
+            val payload =
+                payloadTemplate.copyOf()
 
             // ---------------------------------------------------------
-            // 2. Localiza marcador B4 B4 B4 B4 B4 B4
+            // 2. LOCALIZA HOOK
             // ---------------------------------------------------------
 
-            val hookPattern = ByteArray(6) {
-                0xB4.toByte()
-            }
+            val hookPattern =
+                ByteArray(6) {
+                    0xB4.toByte()
+                }
 
-            val offset = indexOf(
-                payload,
-                hookPattern
+            fileLog(
+                "Procurando marcador B4 B4 B4 B4 B4 B4..."
             )
 
-            if (offset < 0 || offset + 6 > payload.size) {
+            val offset =
+                indexOf(
+                    payload,
+                    hookPattern
+                )
+
+            if (
+                offset < 0 ||
+                offset + 6 > payload.size
+            ) {
+
+                fileError(
+                    "Marcador B4 B4 B4 B4 B4 B4 não encontrado."
+                )
+
                 return@withContext Result.failure(
                     Exception(
                         "Marcador B4 B4 B4 B4 B4 B4 não encontrado no payload."
@@ -122,29 +193,54 @@ class Ps4Payloader(
                 )
             }
 
-            Log.i(
-                TAG,
-                "Hook encontrado no offset: 0x${offset.toString(16).uppercase()}"
+            fileLog(
+                "Hook encontrado no offset: " +
+                    "0x${offset.toString(16).uppercase()}"
             )
 
             // ---------------------------------------------------------
-            // 3. Resolve IP do Android
+            // 3. RESOLVE IP
             // ---------------------------------------------------------
 
-            val localAddr = try {
-                InetAddress.getByName(localIp)
-            } catch (e: Exception) {
-                return@withContext Result.failure(
-                    Exception(
+            fileLog(
+                "Resolvendo endereço local: $localIp"
+            )
+
+            val localAddr =
+                try {
+
+                    InetAddress.getByName(
+                        localIp
+                    )
+
+                } catch (e: Exception) {
+
+                    fileError(
                         "IP local do Android inválido: $localIp",
                         e
                     )
-                )
-            }
 
-            val ipBytes = localAddr.address
+                    return@withContext Result.failure(
+                        Exception(
+                            "IP local do Android inválido: $localIp",
+                            e
+                        )
+                    )
+                }
+
+            val ipBytes =
+                localAddr.address
+
+            fileLog(
+                "Bytes IPv4 encontrados: ${ipBytes.size}"
+            )
 
             if (ipBytes.size != 4) {
+
+                fileError(
+                    "O endereço local não é IPv4: $localIp"
+                )
+
                 return@withContext Result.failure(
                     Exception(
                         "O endereço local precisa ser IPv4. Obtido: $localIp"
@@ -153,7 +249,7 @@ class Ps4Payloader(
             }
 
             // ---------------------------------------------------------
-            // 4. Abre socket temporário para callback
+            // 4. SOCKET CALLBACK
             // ---------------------------------------------------------
 
             ServerSocket(
@@ -162,17 +258,22 @@ class Ps4Payloader(
                 localAddr
             ).use { tempServer ->
 
-                tempServer.soTimeout = CALLBACK_TIMEOUT_MS
+                tempServer.soTimeout =
+                    CALLBACK_TIMEOUT_MS
 
-                val callbackPort = tempServer.localPort
+                val callbackPort =
+                    tempServer.localPort
 
-                Log.i(
-                    TAG,
-                    "Socket de callback criado: $localIp:$callbackPort"
+                fileLog(
+                    "Socket de callback criado:"
+                )
+
+                fileLog(
+                    "$localIp:$callbackPort"
                 )
 
                 // -----------------------------------------------------
-                // 5. Injeta IP + porta no payload
+                // 5. INJETA IP + PORTA
                 // -----------------------------------------------------
 
                 ipBytes.copyInto(
@@ -180,20 +281,28 @@ class Ps4Payloader(
                     offset
                 )
 
-                // Porta em Big Endian / Network Byte Order
                 payload[offset + 4] =
-                    (callbackPort ushr 8).toByte()
+                    (callbackPort ushr 8)
+                        .toByte()
 
                 payload[offset + 5] =
-                    (callbackPort and 0xFF).toByte()
+                    (callbackPort and 0xFF)
+                        .toByte()
 
-                Log.i(
-                    TAG,
-                    "Payload preparado com callback $localIp:$callbackPort"
+                fileLog(
+                    "IP do callback inserido: $localIp"
+                )
+
+                fileLog(
+                    "Porta do callback inserida: $callbackPort"
+                )
+
+                fileLog(
+                    "Payload preparado."
                 )
 
                 // -----------------------------------------------------
-                // 6. Envia para BinLoader
+                // 6. ENVIA BINLOADER
                 // -----------------------------------------------------
 
                 try {
@@ -204,6 +313,11 @@ class Ps4Payloader(
                     )
 
                 } catch (e: ConnectException) {
+
+                    fileError(
+                        "Não foi possível conectar ao BinLoader.",
+                        e
+                    )
 
                     return@withContext Result.failure(
                         Exception(
@@ -216,6 +330,11 @@ class Ps4Payloader(
 
                 } catch (e: SocketTimeoutException) {
 
+                    fileError(
+                        "Tempo limite ao conectar ao BinLoader.",
+                        e
+                    )
+
                     return@withContext Result.failure(
                         Exception(
                             "Tempo limite ao conectar ao BinLoader do PS4 $ps4Ip.",
@@ -225,6 +344,11 @@ class Ps4Payloader(
 
                 } catch (e: Exception) {
 
+                    fileError(
+                        "Erro ao enviar payload ao PS4: ${e.message}",
+                        e
+                    )
+
                     return@withContext Result.failure(
                         Exception(
                             "Erro ao enviar payload ao PS4: ${e.message}",
@@ -233,57 +357,84 @@ class Ps4Payloader(
                     )
                 }
 
-                Log.i(
-                    TAG,
-                    "Payload enviado. Aguardando callback do PS4..."
+                fileLog(
+                    "PAYLOAD ENVIADO COM SUCESSO."
+                )
+
+                fileLog(
+                    "Aguardando callback do PS4..."
                 )
 
                 // -----------------------------------------------------
-                // 7. Aguarda conexão reversa
+                // 7. CALLBACK
                 // -----------------------------------------------------
 
                 try {
 
                     tempServer.accept().use { ps4Client ->
 
-                        ps4Client.soTimeout = 10_000
+                        ps4Client.soTimeout =
+                            10_000
 
                         val remoteAddress =
-                            ps4Client.inetAddress?.hostAddress
+                            ps4Client
+                                .inetAddress
+                                ?.hostAddress
                                 ?: "desconhecido"
 
-                        Log.i(
-                            TAG,
-                            "Callback recebido do PS4: $remoteAddress"
+                        fileLog(
+                            "CALLBACK RECEBIDO DO PS4!"
                         )
 
-                        val info = buildDpiInfo(
-                            url = manifestUrl,
-                            title = itemTitle,
-                            contentId = contentId,
-                            category = category,
-                            size = fileSize,
-                            icon = iconBytes
+                        fileLog(
+                            "IP remoto do callback: $remoteAddress"
                         )
 
-                        Log.i(
-                            TAG,
-                            "Enviando buildInfo: ${info.size} bytes"
+                        // -------------------------------------------------
+                        // 8. BUILD INFO
+                        // -------------------------------------------------
+
+                        fileLog(
+                            "Construindo buildInfo..."
+                        )
+
+                        val info =
+                            buildDpiInfo(
+                                url = manifestUrl,
+                                title = itemTitle,
+                                contentId = contentId,
+                                category = category,
+                                size = fileSize,
+                                icon = iconBytes
+                            )
+
+                        fileLog(
+                            "buildInfo criado: ${info.size} bytes"
+                        )
+
+                        fileLog(
+                            "Enviando buildInfo ao PS4..."
                         )
 
                         val output =
-                            ps4Client.getOutputStream()
+                            ps4Client
+                                .getOutputStream()
 
                         output.write(info)
                         output.flush()
 
-                        Log.i(
-                            TAG,
+                        fileLog(
                             "buildInfo enviado com sucesso."
                         )
                     }
 
                 } catch (e: SocketTimeoutException) {
+
+                    fileError(
+                        "PS4 não retornou conexão para " +
+                            "$localIp:$callbackPort",
+                        e
+                    )
 
                     return@withContext Result.failure(
                         Exception(
@@ -297,17 +448,24 @@ class Ps4Payloader(
                 }
             }
 
-            Log.i(TAG, "========================================")
-            Log.i(TAG, "INJEÇÃO CONCLUÍDA")
-            Log.i(TAG, "========================================")
+            fileLog(
+                "========================================"
+            )
+
+            fileLog(
+                "INJEÇÃO CONCLUÍDA"
+            )
+
+            fileLog(
+                "========================================"
+            )
 
             Result.success(true)
 
         } catch (e: Exception) {
 
-            Log.e(
-                TAG,
-                "Falha geral na injeção",
+            fileError(
+                "FALHA GERAL NA INJEÇÃO: ${e.message}",
                 e
             )
 
@@ -318,31 +476,33 @@ class Ps4Payloader(
     /**
      * Envia o payload para o BinLoader.
      *
-     * Lógica do projeto antigo:
+     * Mantém a lógica do projeto antigo:
      *
-     * rodada 1:
-     *   9090
-     *   9021
-     *   9020
+     * Rodada 1:
+     * 9090 -> 9021 -> 9020
      *
-     * aguarda 3 segundos
+     * espera 3 segundos
      *
-     * rodada 2:
-     *   9090
-     *   9021
-     *   9020
+     * Rodada 2:
+     * 9090 -> 9021 -> 9020
      */
     private fun sendToBinLoader(
         ps4Ip: String,
         payload: ByteArray
     ) {
 
-        var lastError: Exception? = null
+        var lastError: Exception? =
+            null
 
-        repeat(2) { attempt ->
+        // -------------------------------------------------------------
+        // IMPORTANTE:
+        // usamos um for normal em vez de repeat(),
+        // permitindo controlar corretamente o retry.
+        // -------------------------------------------------------------
 
-            Log.i(
-                TAG,
+        for (attempt in 0 until 2) {
+
+            fileLog(
                 "Rodada ${attempt + 1}/2 do BinLoader"
             )
 
@@ -350,16 +510,20 @@ class Ps4Payloader(
 
                 try {
 
-                    Log.i(
-                        TAG,
+                    fileLog(
                         "Tentando BinLoader $ps4Ip:$port"
                     )
 
                     Socket().use { socket ->
 
-                        socket.tcpNoDelay = true
-                        socket.keepAlive = false
-                        socket.soTimeout = 8_000
+                        socket.tcpNoDelay =
+                            true
+
+                        socket.keepAlive =
+                            false
+
+                        socket.soTimeout =
+                            8_000
 
                         socket.connect(
                             InetSocketAddress(
@@ -369,53 +533,76 @@ class Ps4Payloader(
                             CONNECT_TIMEOUT_MS
                         )
 
+                        fileLog(
+                            "Conectado ao BinLoader $ps4Ip:$port"
+                        )
+
                         val output =
                             socket.getOutputStream()
 
-                        output.write(payload)
+                        output.write(
+                            payload
+                        )
+
                         output.flush()
 
-                        Log.i(
-                            TAG,
+                        fileLog(
                             "Payload enviado para $ps4Ip:$port"
                         )
                     }
+
+                    fileLog(
+                        "BinLoader aceitou o envio na porta $port."
+                    )
 
                     return
 
                 } catch (e: Exception) {
 
-                    lastError = e
+                    lastError =
+                        e
 
-                    Log.w(
-                        TAG,
-                        "Falha em $ps4Ip:$port -> ${e.message}"
+                    fileWarn(
+                        "Falha em $ps4Ip:$port -> " +
+                            "${e.javaClass.simpleName}: " +
+                            "${e.message}"
                     )
                 }
             }
 
             if (attempt == 0) {
 
-                Log.i(
-                    TAG,
-                    "Nenhuma porta respondeu. Aguardando 3 segundos..."
+                fileLog(
+                    "Nenhuma porta respondeu na primeira rodada."
+                )
+
+                fileLog(
+                    "Aguardando 3 segundos antes da segunda rodada..."
                 )
 
                 try {
 
-                    Thread.sleep(3_000)
+                    Thread.sleep(
+                        3_000
+                    )
 
                 } catch (e: InterruptedException) {
 
                     Thread.currentThread().interrupt()
 
-                    // IMPORTANTE:
-                    // não usamos "break" aqui porque estamos
-                    // dentro do lambda do repeat().
+                    fileError(
+                        "Thread interrompida durante espera do retry.",
+                        e
+                    )
+
                     throw e
                 }
             }
         }
+
+        fileError(
+            "BinLoader inacessível em 9090/9021/9020."
+        )
 
         throw IllegalStateException(
             "BinLoader inacessível em 9090/9021/9020. " +
@@ -427,7 +614,7 @@ class Ps4Payloader(
     /**
      * Estrutura de informações enviada pelo payload.
      *
-     * Mantida compatível com o projeto antigo:
+     * Compatível com o protocolo do projeto antigo:
      *
      * int32 version
      * string manifestUrl
@@ -455,7 +642,9 @@ class Ps4Payloader(
             out.write(
                 ByteBuffer
                     .allocate(4)
-                    .order(ByteOrder.LITTLE_ENDIAN)
+                    .order(
+                        ByteOrder.LITTLE_ENDIAN
+                    )
                     .putInt(value)
                     .array()
             )
@@ -466,7 +655,9 @@ class Ps4Payloader(
             out.write(
                 ByteBuffer
                     .allocate(8)
-                    .order(ByteOrder.LITTLE_ENDIAN)
+                    .order(
+                        ByteOrder.LITTLE_ENDIAN
+                    )
                     .putLong(value)
                     .array()
             )
@@ -479,59 +670,126 @@ class Ps4Payloader(
                     StandardCharsets.UTF_8
                 )
 
-            i32(bytes.size)
-            out.write(bytes)
+            i32(
+                bytes.size
+            )
+
+            out.write(
+                bytes
+            )
         }
 
-        // Versão do protocolo
+        // -------------------------------------------------------------
+        // VERSION
+        // -------------------------------------------------------------
+
         i32(1)
 
-        // URL do manifesto
+        fileLog(
+            "buildInfo.version = 1"
+        )
+
+        // -------------------------------------------------------------
+        // MANIFEST URL
+        // -------------------------------------------------------------
+
         str(url)
 
-        // Título
+        fileLog(
+            "buildInfo.manifestUrl = $url"
+        )
+
+        // -------------------------------------------------------------
+        // TITLE
+        // -------------------------------------------------------------
+
         str(title)
 
-        // Content ID
+        fileLog(
+            "buildInfo.title = $title"
+        )
+
+        // -------------------------------------------------------------
+        // CONTENT ID
+        // -------------------------------------------------------------
+
         str(contentId)
 
-        // Categoria BGFT
-        val bgftType =
-            normalizeBgftType(category)
+        fileLog(
+            "buildInfo.contentId = $contentId"
+        )
 
-        Log.i(
-            TAG,
+        // -------------------------------------------------------------
+        // BGFT TYPE
+        // -------------------------------------------------------------
+
+        val bgftType =
+            normalizeBgftType(
+                category
+            )
+
+        fileLog(
             "BGFT Type enviado: $bgftType"
         )
 
-        str(bgftType)
+        str(
+            bgftType
+        )
 
-        // Tamanho do PKG
-        i64(size)
+        // -------------------------------------------------------------
+        // FILE SIZE
+        // -------------------------------------------------------------
 
-        // Ícone
-        if (icon == null || icon.isEmpty()) {
+        i64(
+            size
+        )
+
+        fileLog(
+            "buildInfo.fileSize = $size"
+        )
+
+        // -------------------------------------------------------------
+        // ICON
+        // -------------------------------------------------------------
+
+        if (
+            icon == null ||
+            icon.isEmpty()
+        ) {
 
             i32(0)
 
+            fileLog(
+                "buildInfo.iconSize = 0"
+            )
+
         } else {
 
-            i32(icon.size)
-            out.write(icon)
+            i32(
+                icon.size
+            )
+
+            out.write(
+                icon
+            )
+
+            fileLog(
+                "buildInfo.iconSize = ${icon.size}"
+            )
         }
 
-        return out.toByteArray()
+        val result =
+            out.toByteArray()
+
+        fileLog(
+            "buildInfo.totalSize = ${result.size}"
+        )
+
+        return result
     }
 
     /**
      * Normalização da categoria.
-     *
-     * gd          -> PS4GD
-     * gp          -> PS4GP
-     * ac          -> PS4AC
-     * patch       -> PS4GP
-     * update      -> PS4GP
-     * dlc         -> PS4AC
      */
     private fun normalizeBgftType(
         category: String
@@ -607,13 +865,21 @@ class Ps4Payloader(
             i in 0..data.size - pattern.size
         ) {
 
-            var match = true
+            var match =
+                true
 
-            for (j in pattern.indices) {
+            for (
+                j in pattern.indices
+            ) {
 
-                if (data[i + j] != pattern[j]) {
+                if (
+                    data[i + j] !=
+                    pattern[j]
+                ) {
 
-                    match = false
+                    match =
+                        false
+
                     break
                 }
             }
@@ -626,3 +892,6 @@ class Ps4Payloader(
         return -1
     }
 }
+
+
+
