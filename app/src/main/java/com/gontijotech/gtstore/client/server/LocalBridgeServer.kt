@@ -30,10 +30,9 @@ class LocalBridgeServer(
         .readTimeout(30, TimeUnit.SECONDS)
         .build()
 
-    // Inicializa o Payloader
     private val payloader = Ps4Payloader(context)
 
-    // Cache concorrente chaveado por contentId
+    // Cache concorrente chaveado por ID do pacote/jogo
     private val manifestCache = ConcurrentHashMap<String, String>()
 
     @Volatile
@@ -52,13 +51,14 @@ class LocalBridgeServer(
                 // Rota local para injeção via interface web
                 method == Method.POST && uri == "/api/local/inject" -> handleLocalInject(session)
 
-                // Rota local para servir o manifesto BGFT ao PS4
-                method == Method.GET && uri == "/local-manifest.json" -> handleServeLocalManifest(session)
+                // Rota limpa para servir o manifesto BGFT ao PS4 (ex: /manifest/CUSA00184.json ou /local-manifest.json)
+                method == Method.GET && (uri.startsWith("/manifest/") || uri == "/local-manifest.json") -> 
+                    handleServeLocalManifest(session)
 
                 // Proxy da interface web (HTML)
                 uri == "/" || uri == "/index.html" -> handleProxyStatic("$adminHost/index.html", "text/html", session)
 
-                // Encaminhamento transparente de assets e APIs remotas
+                // Encaminhamento de assets e APIs remotas
                 else -> handleProxyForward(session)
             }
         } catch (e: Exception) {
@@ -88,9 +88,12 @@ class LocalBridgeServer(
         val title = json.optString("title", "Jogo PS4")
         val contentId = json.optString("contentId", "CUSA00000").trim()
         val category = json.optString("category", "gd")
-        val size = json.optLong("size", 0L)
+        val rawSize = json.optLong("size", 0L)
 
-        // Resgata link direto com fallback seguro para strings vazias
+        // Garante que o tamanho não seja 0 (mínimo de segurança para o BGFT alocar espaço)
+        val validSize = if (rawSize > 0L) rawSize else 1024L * 1024L * 500L
+
+        // Resgata link direto com fallback seguro
         val directPkgUrl = (json.optString("packageUrl").ifBlank {
             json.optString("pkgUrl").ifBlank {
                 json.optString("url").ifBlank {
@@ -103,15 +106,18 @@ class LocalBridgeServer(
 
         // 1. Gera ou busca o manifesto JSON
         val manifestJsonString: String = if (directPkgUrl.isNotEmpty() && (directPkgUrl.startsWith("http://") || directPkgUrl.startsWith("https://"))) {
+            // No protocolo DPI, o digest deve ter exatamente 64 caracteres hexadecimais (SHA-256)
+            val hexDigest64 = "0".repeat(64)
+
             JSONObject().apply {
-                put("originalFileSize", size)
-                put("packageDigest", "")
+                put("originalFileSize", validSize)
+                put("packageDigest", hexDigest64)
                 put("numberOfSplitFiles", 1)
                 put("pieces", JSONArray().apply {
                     put(JSONObject().apply {
                         put("url", directPkgUrl)
                         put("fileOffset", 0L)
-                        put("fileSize", size)
+                        put("fileSize", validSize)
                     })
                 })
             }.toString()
@@ -161,8 +167,9 @@ class LocalBridgeServer(
         }
 
         // Salva no cache concorrente
-        manifestCache[contentId] = manifestJsonString
-        lastContentId = contentId
+        val safeKey = contentId.ifBlank { "default" }
+        manifestCache[safeKey] = manifestJsonString
+        lastContentId = safeKey
 
         // 2. Determina o IP Wi-Fi local físico do celular
         val localIp = getLocalWifiAddress()
@@ -177,8 +184,9 @@ class LocalBridgeServer(
             )
         }
 
-        val localManifestUrl = "http://$localIp:$port/local-manifest.json?id=$contentId"
-        Log.i(tag, "Manifesto local disponível em: $localManifestUrl")
+        // Rota limpa terminada em .json SEM query string (evita erro 0x80990033)
+        val localManifestUrl = "http://$localIp:$port/manifest/$safeKey.json"
+        Log.i(tag, "Manifesto local fornecido ao PS4: $localManifestUrl")
 
         // 3. Disparo via Payloader
         val result = runBlocking {
@@ -189,7 +197,7 @@ class LocalBridgeServer(
                 itemTitle = title,
                 contentId = contentId,
                 category = category,
-                fileSize = size,
+                fileSize = validSize,
                 iconBytes = null
             )
         }
@@ -205,12 +213,19 @@ class LocalBridgeServer(
     }
 
     private fun handleServeLocalManifest(session: IHTTPSession): Response {
-        // NanoHTTPD mapeia parâmetros de consulta em session.parameters como List<String>
-        val reqId = session.parameters["id"]?.firstOrNull() ?: lastContentId
+        val uri = session.uri
+        // Extrai a chave se vier da rota /manifest/{id}.json
+        val idFromPath = if (uri.startsWith("/manifest/")) {
+            uri.removePrefix("/manifest/").removeSuffix(".json")
+        } else {
+            null
+        }
+
+        val reqId = idFromPath ?: session.parameters["id"]?.firstOrNull() ?: lastContentId
         val manifest = if (!reqId.isNullOrBlank()) manifestCache[reqId] else manifestCache.values.lastOrNull()
 
         return if (manifest != null) {
-            Log.i(tag, "Manifesto entregue ao PS4 para o ID: $reqId")
+            Log.i(tag, "Manifesto entregue com sucesso ao BGFT do PS4 para: $reqId")
             addCors(session, newFixedLengthResponse(Response.Status.OK, "application/json; charset=utf-8", manifest))
         } else {
             Log.w(tag, "PS4 solicitou manifesto inexistente ou expirado no cache.")
@@ -276,7 +291,6 @@ class LocalBridgeServer(
         try {
             val interfaces = NetworkInterface.getNetworkInterfaces()?.toList() ?: return null
 
-            // Filtra interfaces virtuais, VPNs (tun, tap) e redes móveis (rmnet, pdp)
             val validInterfaces = interfaces.filter { intf ->
                 val name = intf.name.lowercase()
                 intf.isUp && !intf.isLoopback &&
@@ -287,14 +301,12 @@ class LocalBridgeServer(
                         !name.contains("dummy")
             }
 
-            // Prioriza interfaces 'wlan' ou ponto de acesso local ('ap')
             val sorted = validInterfaces.sortedByDescending {
                 it.name.startsWith("wlan") || it.name.startsWith("ap")
             }
 
             for (intf in sorted) {
                 for (addr in intf.inetAddresses) {
-                    // Garante que seja IPv4 e endereço de rede local privada (192.168.x, 10.x, 172.16-31.x)
                     if (!addr.isLoopbackAddress && addr is Inet4Address && addr.isSiteLocalAddress) {
                         return addr.hostAddress
                     }
