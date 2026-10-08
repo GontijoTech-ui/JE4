@@ -12,6 +12,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
+import java.io.InputStream
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.util.concurrent.ConcurrentHashMap
@@ -26,13 +27,13 @@ class LocalBridgeServer(
     private val tag = "GTStore-Bridge"
 
     private val proxyClient = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
+        .connectTimeout(12, TimeUnit.SECONDS)
+        .readTimeout(35, TimeUnit.SECONDS)
         .build()
 
     private val payloader = Ps4Payloader(context)
 
-    // Cache concorrente chaveado por ID do pacote/jogo
+    // Cache concorrente de manifestos chaveado por Content-ID
     private val manifestCache = ConcurrentHashMap<String, String>()
 
     @Volatile
@@ -51,7 +52,7 @@ class LocalBridgeServer(
                 // Rota local para injeção via interface web
                 method == Method.POST && uri == "/api/local/inject" -> handleLocalInject(session)
 
-                // Rota limpa para servir o manifesto BGFT ao PS4 (ex: /manifest/CUSA00184.json ou /local-manifest.json)
+                // Rota limpa para servir o manifesto BGFT ao PS4
                 method == Method.GET && (uri.startsWith("/manifest/") || uri == "/local-manifest.json") -> 
                     handleServeLocalManifest(session)
 
@@ -86,17 +87,13 @@ class LocalBridgeServer(
         }
 
         val title = json.optString("title", "Jogo PS4")
-        val contentId = json.optString("contentId", "CUSA00000").trim()
         val rawCategory = json.optString("category", "gd").trim()
-
-        // Padrão do projeto antigo: PS4 + CATEGORIA em maiúsculo (ex: PS4GD)
         val bgftCategory = if (rawCategory.startsWith("PS4", ignoreCase = true)) {
             rawCategory.uppercase()
         } else {
             "PS4" + rawCategory.uppercase()
         }
 
-        // Resgata o link direto com fallbacks
         val directPkgUrl = (json.optString("packageUrl").ifBlank {
             json.optString("pkgUrl").ifBlank {
                 json.optString("url").ifBlank {
@@ -105,114 +102,104 @@ class LocalBridgeServer(
             }
         }).trim()
 
-        val rawManifestUrl = json.optString("manifestUrl", "").trim()
-
-        val manifestJsonString: String
-        var realFileSize = json.optLong("size", 0L)
-
-        if (directPkgUrl.isNotEmpty() && (directPkgUrl.startsWith("http://") || directPkgUrl.startsWith("https://"))) {
-            var realDigest = "0".repeat(64)
-
-            // 1. Extrai o Digest real e o tamanho exato através de um pedido rápido aos primeiros 4KB do PKG
-            try {
-                val rangeReq = Request.Builder()
-                    .url(directPkgUrl)
-                    .addHeader("Range", "bytes=0-4095")
-                    .build()
-
-                proxyClient.newCall(rangeReq).execute().use { resp ->
-                    // Resgata o tamanho real total pelo Content-Range (ex: bytes 0-4095/1532493824)
-                    val cr = resp.header("Content-Range")
-                    val totalLength = cr?.substringAfterLast('/')?.toLongOrNull()
-                        ?: resp.header("Content-Length")?.toLongOrNull()
-                        ?: 0L
-
-                    if (totalLength > 0L) {
-                        realFileSize = totalLength
-                        Log.i(tag, "Tamanho exato do PKG remoto: $realFileSize bytes")
-                    }
-
-                    val headerBytes = resp.body?.bytes()
-                    if (headerBytes != null && headerBytes.size >= 0x1000) {
-                        // Extrai exatamente os 32 bytes do offset 0xFE0 a 0x1000 (SHA-256 do pacote)
-                        realDigest = headerBytes.copyOfRange(0xFE0, 0x1000).joinToString("") { "%02X".format(it) }
-                        Log.i(tag, "Digest real do PKG extraído com sucesso: $realDigest")
-                    }
-                }
-            } catch (e: Exception) {
-                Log.w(tag, "Não foi possível extrair os primeiros 4KB do PKG: ${e.message}")
-            }
-
-            if (realFileSize <= 0L) {
-                realFileSize = 1024L * 1024L * 500L // Fallback de segurança
-            }
-
-            // 2. Monta o manifesto no padrão aceito pelo DirectPackageInstaller
-            manifestJsonString = JSONObject().apply {
-                put("originalFileSize", realFileSize)
-                put("packageDigest", realDigest)
-                put("numberOfSplitFiles", 1)
-                put("pieces", JSONArray().apply {
-                    put(JSONObject().apply {
-                        put("url", directPkgUrl)
-                        put("fileOffset", 0L)
-                        put("fileSize", realFileSize)
-                        put("hashValue", "0000000000000000000000000000000000000000") // 40 zeros exigidos pelo BGFT
-                    })
-                })
-            }.toString()
-
-        } else if (rawManifestUrl.isNotEmpty()) {
-            val remoteManifestUrl = when {
-                rawManifestUrl.startsWith("http://") || rawManifestUrl.startsWith("https://") -> rawManifestUrl
-                rawManifestUrl.startsWith("/") -> "$adminHost$rawManifestUrl"
-                else -> "$adminHost/json/$rawManifestUrl.json"
-            }
-
-            Log.i(tag, "Buscando manifesto remoto em: $remoteManifestUrl")
-
-            val req = Request.Builder().url(remoteManifestUrl).build()
-            try {
-                proxyClient.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) {
-                        return addCors(
-                            session,
-                            newFixedLengthResponse(
-                                Response.Status.BAD_REQUEST,
-                                "application/json",
-                                """{"success":false,"error":"Servidor remoto retornou HTTP ${resp.code} ao buscar manifesto."}"""
-                            )
-                        )
-                    }
-                    manifestJsonString = resp.body?.string() ?: ""
-                }
-            } catch (e: Exception) {
-                return addCors(
-                    session,
-                    newFixedLengthResponse(
-                        Response.Status.INTERNAL_ERROR,
-                        "application/json",
-                        """{"success":false,"error":"Falha de rede ao buscar manifesto: ${e.message}"}"""
-                    )
-                )
-            }
-        } else {
+        if (directPkgUrl.isEmpty()) {
             return addCors(
                 session,
                 newFixedLengthResponse(
                     Response.Status.BAD_REQUEST,
                     "application/json",
-                    """{"success":false,"error":"Nenhum link direto (packageUrl) ou manifesto configurado."}"""
+                    """{"success":false,"error":"Nenhum link direto configurado."}"""
                 )
             )
         }
 
-        // Salva no cache
-        val safeKey = contentId.ifBlank { "default" }
-        manifestCache[safeKey] = manifestJsonString
-        lastContentId = safeKey
+        // Tenta capturar ID preliminar enviado pela loja
+        var detectedContentId = (json.optString("contentId").ifBlank {
+            json.optString("content_id").ifBlank {
+                json.optString("cusa").ifBlank { json.optString("id") }
+            }
+        }).trim()
 
-        // 3. Obtém o IP físico do celular
+        var realFileSize = json.optLong("size", 0L)
+        var realDigest = "0".repeat(64)
+
+        // 1. Download seguro e estrito dos primeiros 4KB do PKG via Stream (sem sobrecarregar a RAM)
+        try {
+            val rangeReq = Request.Builder()
+                .url(directPkgUrl)
+                .addHeader("Range", "bytes=0-4095")
+                .build()
+
+            proxyClient.newCall(rangeReq).execute().use { resp ->
+                val cr = resp.header("Content-Range")
+                val totalLength = cr?.substringAfterLast('/')?.toLongOrNull()
+                    ?: resp.header("Content-Length")?.toLongOrNull()
+                    ?: 0L
+
+                if (totalLength > 0L) {
+                    realFileSize = totalLength
+                    Log.i(tag, "Tamanho exato do PKG remoto: $realFileSize bytes")
+                }
+
+                val stream: InputStream? = resp.body?.byteStream()
+                if (stream != null) {
+                    val headerBytes = ByteArray(0x1000)
+                    var bytesRead = 0
+                    while (bytesRead < 0x1000) {
+                        val count = stream.read(headerBytes, bytesRead, 0x1000 - bytesRead)
+                        if (count == -1) break
+                        bytesRead += count
+                    }
+
+                    // Extrai o Content-ID oficial de 36 caracteres do binário (offset 0x40)
+                    if (bytesRead >= (0x40 + 36)) {
+                        val pkgContentId = String(headerBytes, 0x40, 36, Charsets.US_ASCII).trim('\u0000', ' ')
+                        if (pkgContentId.length >= 16 && pkgContentId.contains("-")) {
+                            detectedContentId = pkgContentId
+                            Log.i(tag, "Content-ID oficial extraído do binário: $detectedContentId")
+                        }
+                    }
+
+                    // Extrai o SHA-256 real do PKG (offset 0xFE0 a 0x1000)
+                    if (bytesRead >= 0x1000) {
+                        realDigest = headerBytes.copyOfRange(0xFE0, 0x1000).joinToString("") { "%02X".format(it) }
+                        Log.i(tag, "Digest SHA-256 real extraído: $realDigest")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(tag, "Aviso ao recolher metadados remotos do PKG: ${e.message}")
+        }
+
+        // Garante Content-ID e tamanho válidos sem duplicidade
+        val finalContentId = if (detectedContentId.isNotBlank()) {
+            detectedContentId
+        } else {
+            "CUSA" + System.currentTimeMillis().toString().takeLast(5)
+        }
+
+        if (realFileSize <= 0L) {
+            realFileSize = 1024L * 1024L * 500L // Fallback de 500MB se o servidor ocultar cabeçalhos
+        }
+
+        // 2. Constrói o manifesto BGFT no padrão oficial do DirectPackageInstaller
+        val manifestJsonString = JSONObject().apply {
+            put("originalFileSize", realFileSize)
+            put("packageDigest", realDigest)
+            put("numberOfSplitFiles", 1)
+            put("pieces", JSONArray().apply {
+                put(JSONObject().apply {
+                    put("url", directPkgUrl)
+                    put("fileOffset", 0L)
+                    put("fileSize", realFileSize)
+                    put("hashValue", "0000000000000000000000000000000000000000") // 40 zeros exigidos pelo BGFT
+                })
+            })
+        }.toString()
+
+        manifestCache[finalContentId] = manifestJsonString
+        lastContentId = finalContentId
+
         val localIp = getLocalWifiAddress()
         if (localIp == null) {
             return addCors(
@@ -220,22 +207,22 @@ class LocalBridgeServer(
                 newFixedLengthResponse(
                     Response.Status.BAD_REQUEST,
                     "application/json",
-                    """{"success":false,"error":"O aparelho não está conectado a uma rede Wi-Fi local válida."}"""
+                    """{"success":false,"error":"O aparelho não está conectado ao Wi-Fi local."}"""
                 )
             )
         }
 
-        val localManifestUrl = "http://$localIp:$port/manifest/$safeKey.json"
-        Log.i(tag, "Manifesto local fornecido ao PS4: $localManifestUrl")
+        val localManifestUrl = "http://$localIp:$port/manifest/$finalContentId.json"
+        Log.i(tag, "A enviar tarefa: $title | ID: $finalContentId | Tamanho: $realFileSize")
 
-        // 4. Disparo via Payloader
+        // 3. Disparo do Payload via BinLoader (porta 9090)
         val result = runBlocking {
             payloader.injectDpiPayload(
                 ps4Ip = ps4Ip,
                 localIp = localIp,
                 manifestUrl = localManifestUrl,
                 itemTitle = title,
-                contentId = contentId,
+                contentId = finalContentId,
                 category = bgftCategory,
                 fileSize = realFileSize,
                 iconBytes = null
