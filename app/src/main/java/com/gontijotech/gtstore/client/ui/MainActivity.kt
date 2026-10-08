@@ -12,9 +12,12 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.FrameLayout
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.enableEdgeToEdge
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import com.gontijotech.gtstore.client.service.LocalBridgeService
 
 class MainActivity : ComponentActivity() {
@@ -27,27 +30,51 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Habilita tela cheia ponta a ponta (Edge-to-Edge)
+        // Habilita ponta a ponta
         enableEdgeToEdge()
 
-        // 1. Inicia o serviço do servidor local em segundo plano
+        // 1. Inicia o serviço do servidor local
         startLocalBridgeService()
 
-        // 2. Configura a WebView em tela cheia
+        // 2. Configura a WebView
         webView = WebView(this).apply {
-            setBackgroundColor(Color.parseColor("#06080d")) // Fundo escuro idêntico à loja
+            setBackgroundColor(Color.parseColor("#06080d"))
             scrollBarStyle = View.SCROLLBARS_INSIDE_OVERLAY
         }
 
         configureWebSettings(webView.settings)
         setupWebViewClient()
 
-        setContentView(webView)
+        // 3. Container com fundo escuro que aplica o espaçamento seguro do sistema
+        val rootLayout = FrameLayout(this).apply {
+            setBackgroundColor(Color.parseColor("#06080d"))
+            addView(
+                webView,
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT
+                )
+            )
+        }
 
-        // 3. Carrega a loja local
+        // 4. Aplica os insets: afasta a barra de status no topo e a de gestos no rodapé
+        ViewCompat.setOnApplyWindowInsetsListener(rootLayout) { view, insets ->
+            val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            view.setPadding(
+                systemBars.left,
+                systemBars.top,     // Respeita o relógio, bateria e notch da câmera
+                systemBars.right,
+                systemBars.bottom   // Respeita a barra de gestos inferior
+            )
+            insets
+        }
+
+        setContentView(rootLayout)
+
+        // 5. Carrega a loja
         webView.loadUrl(localServerUrl)
 
-        // 4. Suporte nativo ao gesto de voltar
+        // 6. Gesto/botão nativo de voltar
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 if (webView.canGoBack()) {
@@ -72,17 +99,14 @@ class MainActivity : ComponentActivity() {
     private fun configureWebSettings(settings: WebSettings) {
         settings.apply {
             javaScriptEnabled = true
-            // Fundamental para o carrinho, IP e pedidos persistirem no app
             domStorageEnabled = true
             databaseEnabled = true
 
-            // Layout responsivo
             useWideViewPort = true
             loadWithOverviewMode = true
             displayZoomControls = false
             builtInZoomControls = false
 
-            // Suporte a chamadas HTTP locais + HTTPS do Firebase
             mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             cacheMode = WebSettings.LOAD_DEFAULT
         }
@@ -94,7 +118,6 @@ class MainActivity : ComponentActivity() {
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                 val url = request?.url?.toString() ?: return false
 
-                // Intercepta links do WhatsApp e abre no aplicativo nativo
                 if (url.startsWith("whatsapp://") || url.contains("wa.me") || url.contains("api.whatsapp.com")) {
                     try {
                         val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
@@ -105,7 +128,6 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                // Mantém a navegação interna dentro do próprio WebView
                 return false
             }
 
@@ -116,7 +138,6 @@ class MainActivity : ComponentActivity() {
             ) {
                 super.onReceivedError(view, request, error)
 
-                // Se o WebView carregar antes do servidor na 8080 terminar de subir, tenta reconectar após 600ms
                 if (request?.isForMainFrame == true && !isReloading) {
                     isReloading = true
                     view?.postDelayed({
