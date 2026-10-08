@@ -33,7 +33,7 @@ class LocalBridgeServer(
     // Inicializa o Payloader
     private val payloader = Ps4Payloader(context)
 
-    // Cache em memória chaveado por contentId para evitar race conditions
+    // Cache concorrente chaveado por contentId
     private val manifestCache = ConcurrentHashMap<String, String>()
 
     @Volatile
@@ -90,14 +90,14 @@ class LocalBridgeServer(
         val category = json.optString("category", "gd")
         val size = json.optLong("size", 0L)
 
-        // Resgata link direto enviado pelo frontend
-        val directPkgUrl = json.optString("packageUrl",
-            json.optString("pkgUrl",
-                json.optString("url",
-                    json.optString("directUrl", "")
-                )
-            )
-        ).trim()
+        // Resgata link direto com fallback seguro para strings vazias
+        val directPkgUrl = (json.optString("packageUrl").ifBlank {
+            json.optString("pkgUrl").ifBlank {
+                json.optString("url").ifBlank {
+                    json.optString("directUrl")
+                }
+            }
+        }).trim()
 
         val rawManifestUrl = json.optString("manifestUrl", "").trim()
 
@@ -164,7 +164,7 @@ class LocalBridgeServer(
         manifestCache[contentId] = manifestJsonString
         lastContentId = contentId
 
-        // 2. Determina o IP Wi-Fi local do celular
+        // 2. Determina o IP Wi-Fi local físico do celular
         val localIp = getLocalWifiAddress()
         if (localIp == null) {
             return addCors(
@@ -207,7 +207,7 @@ class LocalBridgeServer(
     private fun handleServeLocalManifest(session: IHTTPSession): Response {
         // NanoHTTPD mapeia parâmetros de consulta em session.parameters como List<String>
         val reqId = session.parameters["id"]?.firstOrNull() ?: lastContentId
-        val manifest = if (!reqId.isNullOrBlank()) manifestCache[reqId] else null
+        val manifest = if (!reqId.isNullOrBlank()) manifestCache[reqId] else manifestCache.values.lastOrNull()
 
         return if (manifest != null) {
             Log.i(tag, "Manifesto entregue ao PS4 para o ID: $reqId")
@@ -231,12 +231,24 @@ class LocalBridgeServer(
         val targetUrl = "$adminHost${session.uri}$queryString"
         val reqBuilder = Request.Builder().url(targetUrl)
 
-        if (session.method == Method.POST) {
-            val map = HashMap<String, String>()
-            session.parseBody(map)
-            val bodyText = map["postData"] ?: ""
-            val contentType = session.headers["content-type"] ?: "application/json"
-            reqBuilder.post(bodyText.toRequestBody(contentType.toMediaTypeOrNull()))
+        when (session.method) {
+            Method.POST -> {
+                val map = HashMap<String, String>()
+                session.parseBody(map)
+                val bodyText = map["postData"] ?: ""
+                val contentType = session.headers["content-type"] ?: "application/json"
+                reqBuilder.post(bodyText.toRequestBody(contentType.toMediaTypeOrNull()))
+            }
+            Method.PUT -> {
+                val map = HashMap<String, String>()
+                session.parseBody(map)
+                val bodyText = map["postData"] ?: ""
+                val contentType = session.headers["content-type"] ?: "application/json"
+                reqBuilder.put(bodyText.toRequestBody(contentType.toMediaTypeOrNull()))
+            }
+            Method.DELETE -> reqBuilder.delete()
+            Method.HEAD -> reqBuilder.head()
+            else -> reqBuilder.get()
         }
 
         return proxyClient.newCall(reqBuilder.build()).execute().use { resp ->
@@ -263,13 +275,27 @@ class LocalBridgeServer(
     private fun getLocalWifiAddress(): String? {
         try {
             val interfaces = NetworkInterface.getNetworkInterfaces()?.toList() ?: return null
-            // Prioriza interfaces 'wlan' (Wi-Fi)
-            val sorted = interfaces.sortedByDescending { it.name.startsWith("wlan") }
+
+            // Filtra interfaces virtuais, VPNs (tun, tap) e redes móveis (rmnet, pdp)
+            val validInterfaces = interfaces.filter { intf ->
+                val name = intf.name.lowercase()
+                intf.isUp && !intf.isLoopback &&
+                        !name.contains("tun") &&
+                        !name.contains("tap") &&
+                        !name.contains("rmnet") &&
+                        !name.contains("pdp") &&
+                        !name.contains("dummy")
+            }
+
+            // Prioriza interfaces 'wlan' ou ponto de acesso local ('ap')
+            val sorted = validInterfaces.sortedByDescending {
+                it.name.startsWith("wlan") || it.name.startsWith("ap")
+            }
 
             for (intf in sorted) {
-                if (intf.isLoopback || !intf.isUp) continue
                 for (addr in intf.inetAddresses) {
-                    if (!addr.isLoopbackAddress && addr is Inet4Address) {
+                    // Garante que seja IPv4 e endereço de rede local privada (192.168.x, 10.x, 172.16-31.x)
+                    if (!addr.isLoopbackAddress && addr is Inet4Address && addr.isSiteLocalAddress) {
                         return addr.hostAddress
                     }
                 }
