@@ -1,6 +1,7 @@
 package com.gontijotech.gtstore.client.network
 
 import android.content.Context
+import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
@@ -67,16 +68,17 @@ class Ps4Payloader(
     ): Result<Boolean> = withContext(Dispatchers.IO) {
 
         try {
-            android.util.Log.i(TAG, "========================================")
-            android.util.Log.i(TAG, "INÍCIO DA INJEÇÃO")
-            android.util.Log.i(TAG, "PS4       : $ps4Ip")
-            android.util.Log.i(TAG, "Android   : $localIp")
-            android.util.Log.i(TAG, "Manifesto : $manifestUrl")
-            android.util.Log.i(TAG, "Título    : $itemTitle")
-            android.util.Log.i(TAG, "ContentID : $contentId")
-            android.util.Log.i(TAG, "Categoria : $category")
-            android.util.Log.i(TAG, "Tamanho   : $fileSize")
-            android.util.Log.i(TAG, "========================================")
+
+            Log.i(TAG, "========================================")
+            Log.i(TAG, "INÍCIO DA INJEÇÃO")
+            Log.i(TAG, "PS4       : $ps4Ip")
+            Log.i(TAG, "Android   : $localIp")
+            Log.i(TAG, "Manifesto : $manifestUrl")
+            Log.i(TAG, "Título    : $itemTitle")
+            Log.i(TAG, "ContentID : $contentId")
+            Log.i(TAG, "Categoria : $category")
+            Log.i(TAG, "Tamanho   : $fileSize")
+            Log.i(TAG, "========================================")
 
             // ---------------------------------------------------------
             // 1. Carrega o payload
@@ -92,7 +94,7 @@ class Ps4Payloader(
                         )
                     )
 
-            android.util.Log.i(
+            Log.i(
                 TAG,
                 "Payload carregado: ${payloadTemplate.size} bytes"
             )
@@ -120,7 +122,7 @@ class Ps4Payloader(
                 )
             }
 
-            android.util.Log.i(
+            Log.i(
                 TAG,
                 "Hook encontrado no offset: 0x${offset.toString(16).uppercase()}"
             )
@@ -151,7 +153,7 @@ class Ps4Payloader(
             }
 
             // ---------------------------------------------------------
-            // 4. Abre socket temporário
+            // 4. Abre socket temporário para callback
             // ---------------------------------------------------------
 
             ServerSocket(
@@ -164,7 +166,7 @@ class Ps4Payloader(
 
                 val callbackPort = tempServer.localPort
 
-                android.util.Log.i(
+                Log.i(
                     TAG,
                     "Socket de callback criado: $localIp:$callbackPort"
                 )
@@ -185,7 +187,7 @@ class Ps4Payloader(
                 payload[offset + 5] =
                     (callbackPort and 0xFF).toByte()
 
-                android.util.Log.i(
+                Log.i(
                     TAG,
                     "Payload preparado com callback $localIp:$callbackPort"
                 )
@@ -195,10 +197,12 @@ class Ps4Payloader(
                 // -----------------------------------------------------
 
                 try {
+
                     sendToBinLoader(
                         ps4Ip = ps4Ip,
                         payload = payload
                     )
+
                 } catch (e: ConnectException) {
 
                     return@withContext Result.failure(
@@ -229,7 +233,7 @@ class Ps4Payloader(
                     )
                 }
 
-                android.util.Log.i(
+                Log.i(
                     TAG,
                     "Payload enviado. Aguardando callback do PS4..."
                 )
@@ -248,7 +252,7 @@ class Ps4Payloader(
                             ps4Client.inetAddress?.hostAddress
                                 ?: "desconhecido"
 
-                        android.util.Log.i(
+                        Log.i(
                             TAG,
                             "Callback recebido do PS4: $remoteAddress"
                         )
@@ -262,7 +266,7 @@ class Ps4Payloader(
                             icon = iconBytes
                         )
 
-                        android.util.Log.i(
+                        Log.i(
                             TAG,
                             "Enviando buildInfo: ${info.size} bytes"
                         )
@@ -273,7 +277,7 @@ class Ps4Payloader(
                         output.write(info)
                         output.flush()
 
-                        android.util.Log.i(
+                        Log.i(
                             TAG,
                             "buildInfo enviado com sucesso."
                         )
@@ -293,24 +297,15 @@ class Ps4Payloader(
                 }
             }
 
-            android.util.Log.i(
-                TAG,
-                "========================================"
-            )
-            android.util.Log.i(
-                TAG,
-                "INJEÇÃO CONCLUÍDA"
-            )
-            android.util.Log.i(
-                TAG,
-                "========================================"
-            )
+            Log.i(TAG, "========================================")
+            Log.i(TAG, "INJEÇÃO CONCLUÍDA")
+            Log.i(TAG, "========================================")
 
             Result.success(true)
 
         } catch (e: Exception) {
 
-            android.util.Log.e(
+            Log.e(
                 TAG,
                 "Falha geral na injeção",
                 e
@@ -323,16 +318,16 @@ class Ps4Payloader(
     /**
      * Envia o payload para o BinLoader.
      *
-     * Compatível com a lógica do projeto antigo:
+     * Lógica do projeto antigo:
      *
-     * tentativa 1:
+     * rodada 1:
      *   9090
      *   9021
      *   9020
      *
      * aguarda 3 segundos
      *
-     * tentativa 2:
+     * rodada 2:
      *   9090
      *   9021
      *   9020
@@ -346,7 +341,7 @@ class Ps4Payloader(
 
         repeat(2) { attempt ->
 
-            android.util.Log.i(
+            Log.i(
                 TAG,
                 "Rodada ${attempt + 1}/2 do BinLoader"
             )
@@ -355,7 +350,7 @@ class Ps4Payloader(
 
                 try {
 
-                    android.util.Log.i(
+                    Log.i(
                         TAG,
                         "Tentando BinLoader $ps4Ip:$port"
                     )
@@ -380,7 +375,7 @@ class Ps4Payloader(
                         output.write(payload)
                         output.flush()
 
-                        android.util.Log.i(
+                        Log.i(
                             TAG,
                             "Payload enviado para $ps4Ip:$port"
                         )
@@ -392,7 +387,7 @@ class Ps4Payloader(
 
                     lastError = e
 
-                    android.util.Log.w(
+                    Log.w(
                         TAG,
                         "Falha em $ps4Ip:$port -> ${e.message}"
                     )
@@ -401,23 +396,29 @@ class Ps4Payloader(
 
             if (attempt == 0) {
 
-                android.util.Log.i(
+                Log.i(
                     TAG,
                     "Nenhuma porta respondeu. Aguardando 3 segundos..."
                 )
 
                 try {
+
                     Thread.sleep(3_000)
-                } catch (_: InterruptedException) {
+
+                } catch (e: InterruptedException) {
+
                     Thread.currentThread().interrupt()
-                    break
+
+                    // IMPORTANTE:
+                    // não usamos "break" aqui porque estamos
+                    // dentro do lambda do repeat().
+                    throw e
                 }
             }
         }
 
         throw IllegalStateException(
-            "BinLoader inacessível em " +
-                "9090/9021/9020. " +
+            "BinLoader inacessível em 9090/9021/9020. " +
                 "Verifique GoldHEN > BinLoader.",
             lastError
         )
@@ -485,7 +486,7 @@ class Ps4Payloader(
         // Versão do protocolo
         i32(1)
 
-        // Manifesto
+        // URL do manifesto
         str(url)
 
         // Título
@@ -498,14 +499,14 @@ class Ps4Payloader(
         val bgftType =
             normalizeBgftType(category)
 
-        android.util.Log.i(
+        Log.i(
             TAG,
             "BGFT Type enviado: $bgftType"
         )
 
         str(bgftType)
 
-        // Tamanho
+        // Tamanho do PKG
         i64(size)
 
         // Ícone
@@ -523,14 +524,14 @@ class Ps4Payloader(
     }
 
     /**
-     * Mantém a mesma convenção do projeto antigo:
+     * Normalização da categoria.
      *
-     * gd    -> PS4GD
-     * gp    -> PS4GP
-     * ac    -> PS4AC
-     *
-     * patch/update -> PS4GP
-     * dlc -> PS4AC
+     * gd          -> PS4GD
+     * gp          -> PS4GP
+     * ac          -> PS4AC
+     * patch       -> PS4GP
+     * update      -> PS4GP
+     * dlc         -> PS4AC
      */
     private fun normalizeBgftType(
         category: String
@@ -556,6 +557,9 @@ class Ps4Payloader(
         }
     }
 
+    /**
+     * Carrega payload dos assets.
+     */
     private fun loadPayload(
         name: String
     ): ByteArray? {
@@ -577,12 +581,16 @@ class Ps4Payloader(
                     }
 
             } catch (_: Exception) {
+                // Tenta o próximo caminho.
             }
         }
 
         return null
     }
 
+    /**
+     * Procura uma sequência de bytes dentro do payload.
+     */
     private fun indexOf(
         data: ByteArray,
         pattern: ByteArray
@@ -603,9 +611,7 @@ class Ps4Payloader(
 
             for (j in pattern.indices) {
 
-                if (
-                    data[i + j] != pattern[j]
-                ) {
+                if (data[i + j] != pattern[j]) {
 
                     match = false
                     break
