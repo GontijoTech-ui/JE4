@@ -31,20 +31,11 @@ class LocalBridgeServer(
     private val tag = "GTStore-Bridge"
 
     companion object {
-        /*
-         * Estrutura básica de PKG PS4.
-         *
-         * Magic:
-         * 0x7F 43 4E 54
-         *
-         * Content ID:
-         * offset 0x40
-         * tamanho 36 bytes
-         *
-         * Digest:
-         * offset 0xFE0
-         * tamanho 32 bytes
-         */
+
+        // ============================================================
+        // ESTRUTURA BÁSICA DO CABEÇALHO PKG
+        // ============================================================
+
         private const val PKG_MAGIC = 0x7F434E54L
 
         private const val PKG_HEADER_SIZE = 0x1000
@@ -54,6 +45,10 @@ class LocalBridgeServer(
 
         private const val DIGEST_OFFSET = 0xFE0
         private const val DIGEST_LENGTH = 32
+
+        // Quantidade máxima de HTML que será gravada no log.
+        // Evita colocar uma página inteira no GTSTORE-log.txt.
+        private const val MAX_HTML_LOG = 2500
     }
 
     // ================================================================
@@ -66,10 +61,11 @@ class LocalBridgeServer(
             .readTimeout(35, TimeUnit.SECONDS)
             .followRedirects(true)
             .followSslRedirects(true)
+            .retryOnConnectionFailure(true)
             .build()
 
     // ================================================================
-    // CLIENTE PARA STREAMING DO PKG
+    // CLIENTE PARA STREAMING
     // ================================================================
 
     private val streamClient =
@@ -85,11 +81,13 @@ class LocalBridgeServer(
     private val payloader =
         Ps4Payloader(context)
 
-    // Content-ID -> manifesto JSON
+    // ================================================================
+    // CACHE
+    // ================================================================
+
     private val manifestCache =
         ConcurrentHashMap<String, String>()
 
-    // Content-ID -> URL remota
     private val pkgUrlCache =
         ConcurrentHashMap<String, String>()
 
@@ -102,40 +100,61 @@ class LocalBridgeServer(
 
     private fun fileLog(message: String) {
         Log.i(tag, message)
-        GTStoreFileLogger.log(context, tag, message)
+        GTStoreFileLogger.log(
+            context,
+            tag,
+            message
+        )
     }
 
     private fun fileWarn(message: String) {
         Log.w(tag, message)
-        GTStoreFileLogger.log(context, tag, "WARN: $message")
+        GTStoreFileLogger.log(
+            context,
+            tag,
+            "WARN: $message"
+        )
     }
 
     private fun fileError(
         message: String,
         throwable: Throwable? = null
     ) {
-        Log.e(tag, message, throwable)
+        Log.e(
+            tag,
+            message,
+            throwable
+        )
 
         GTStoreFileLogger.log(
             context,
             tag,
             "ERROR: $message" +
-                (throwable?.message?.let { " | $it" } ?: "")
+                (
+                    throwable?.message
+                        ?.let { " | $it" }
+                        ?: ""
+                    )
         )
     }
 
     // ================================================================
-    // ROUTER PRINCIPAL
+    // ROUTER
     // ================================================================
 
-    override fun serve(session: IHTTPSession): Response {
+    override fun serve(
+        session: IHTTPSession
+    ): Response {
 
         val uri = session.uri
         val method = session.method
 
-        fileLog("Requisição: $method $uri")
+        fileLog(
+            "Requisição: $method $uri"
+        )
 
         if (method == Method.OPTIONS) {
+
             return addCors(
                 session,
                 newFixedLengthResponse(
@@ -182,6 +201,7 @@ class LocalBridgeServer(
                 }
 
                 else -> {
+
                     handleProxyForward(session)
                 }
             }
@@ -193,34 +213,37 @@ class LocalBridgeServer(
                 e
             )
 
-            val err = JSONObject()
-                .put("success", false)
-                .put(
-                    "error",
-                    e.message ?: "Erro interno no LocalBridgeServer"
-                )
-                .toString()
+            val errorJson =
+                JSONObject()
+                    .put("success", false)
+                    .put(
+                        "error",
+                        e.message
+                            ?: "Erro interno no LocalBridgeServer"
+                    )
+                    .toString()
 
             addCors(
                 session,
                 newFixedLengthResponse(
                     Response.Status.INTERNAL_ERROR,
                     "application/json",
-                    err
+                    errorJson
                 )
             )
         }
     }
 
     // ================================================================
-    // INJEÇÃO
+    // INJEÇÃO LOCAL
     // ================================================================
 
     private fun handleLocalInject(
         session: IHTTPSession
     ): Response {
 
-        val map = HashMap<String, String>()
+        val map =
+            HashMap<String, String>()
 
         session.parseBody(map)
 
@@ -232,14 +255,18 @@ class LocalBridgeServer(
         fileLog("JSON recebido da interface:")
         fileLog(postData)
 
-        val json = JSONObject(postData)
+        val json =
+            JSONObject(postData)
 
         val ps4Ip =
-            json.optString("ps4Ip").trim()
+            json.optString("ps4Ip")
+                .trim()
 
         if (ps4Ip.isEmpty()) {
 
-            fileWarn("IP do PS4 não informado.")
+            fileWarn(
+                "IP do PS4 não informado."
+            )
 
             return jsonError(
                 session,
@@ -258,7 +285,8 @@ class LocalBridgeServer(
             json.optString(
                 "category",
                 "gd"
-            ).trim()
+            )
+                .trim()
 
         val bgftCategory =
             if (
@@ -267,16 +295,19 @@ class LocalBridgeServer(
                     ignoreCase = true
                 )
             ) {
+
                 rawCategory.uppercase()
+
             } else {
+
                 "PS4${rawCategory.uppercase()}"
             }
 
-        // ------------------------------------------------------------
+        // ============================================================
         // URL DO PKG
-        // ------------------------------------------------------------
+        // ============================================================
 
-        val directPkgUrl = (
+        val directPkgUrl =
             json.optString("packageUrl")
                 .ifBlank {
                     json.optString("pkgUrl")
@@ -287,7 +318,7 @@ class LocalBridgeServer(
                 .ifBlank {
                     json.optString("directUrl")
                 }
-        ).trim()
+                .trim()
 
         if (directPkgUrl.isEmpty()) {
 
@@ -302,9 +333,9 @@ class LocalBridgeServer(
             )
         }
 
-        // ------------------------------------------------------------
-        // CONTENT ID ORIGINAL DA INTERFACE
-        // ------------------------------------------------------------
+        // ============================================================
+        // CONTENT-ID DA INTERFACE
+        // ============================================================
 
         var detectedContentId =
             json.optString("contentId")
@@ -320,433 +351,159 @@ class LocalBridgeServer(
                 .trim()
 
         var realFileSize =
-            json.optLong("size", 0L)
+            json.optLong(
+                "size",
+                0L
+            )
 
         var realDigest =
             "0".repeat(64)
 
-        fileLog("PS4: $ps4Ip")
-        fileLog("Título: $title")
-        fileLog("Categoria recebida: $rawCategory")
-        fileLog("Categoria BGFT: $bgftCategory")
-        fileLog("PKG direto: $directPkgUrl")
         fileLog(
-            "Content-ID inicial: ${
-                if (detectedContentId.isBlank()) {
+            "PS4: $ps4Ip"
+        )
+
+        fileLog(
+            "Título: $title"
+        )
+
+        fileLog(
+            "Categoria recebida: $rawCategory"
+        )
+
+        fileLog(
+            "Categoria BGFT: $bgftCategory"
+        )
+
+        fileLog(
+            "PKG direto: $directPkgUrl"
+        )
+
+        fileLog(
+            "Content-ID inicial: " +
+                if (
+                    detectedContentId.isBlank()
+                ) {
                     "(vazio)"
                 } else {
                     detectedContentId
                 }
-            }"
         )
+
         fileLog(
-            "Tamanho informado pela interface: $realFileSize"
+            "Tamanho informado pela interface: " +
+                realFileSize
         )
 
         // ============================================================
-        // INSPEÇÃO DO PKG REMOTO
+        // DIAGNÓSTICO REMOTO
         // ============================================================
 
-        try {
+        inspectRemotePackage(
+            directPkgUrl = directPkgUrl,
+            initialContentId = detectedContentId
+        )?.let { metadata ->
 
-            fileLog("----------------------------------------")
-            fileLog("INSPEÇÃO DO PKG REMOTO")
-            fileLog("URL: $directPkgUrl")
-            fileLog("Solicitando Range: bytes=0-4095")
+            if (
+                metadata.isValidPkg
+            ) {
 
-            val rangeRequest =
-                Request.Builder()
-                    .url(directPkgUrl)
+                fileLog(
+                    "========================================"
+                )
 
-                    /*
-                     * Mantemos o User-Agent do PS4 para evitar
-                     * respostas diferentes de alguns servidores/CDNs.
-                     */
-                    .addHeader(
-                        "User-Agent",
-                        "PlayStation 4"
+                fileLog(
+                    "PKG REMOTO VALIDADO COM SUCESSO"
+                )
+
+                fileLog(
+                    "Content-ID remoto: " +
+                        metadata.contentId
+                )
+
+                fileLog(
+                    "Tamanho remoto: " +
+                        metadata.fileSize
+                )
+
+                fileLog(
+                    "Digest remoto: " +
+                        metadata.digest
+                )
+
+                fileLog(
+                    "========================================"
+                )
+
+                if (
+                    isValidContentId(
+                        metadata.contentId
                     )
+                ) {
 
-                    .addHeader(
-                        "Accept",
-                        "application/octet-stream,*/*"
-                    )
-
-                    .addHeader(
-                        "Range",
-                        "bytes=0-4095"
-                    )
-
-                    .build()
-
-            proxyClient
-                .newCall(rangeRequest)
-                .execute()
-                .use { response ->
+                    detectedContentId =
+                        metadata.contentId
 
                     fileLog(
-                        "HTTP remoto: ${response.code}"
+                        "Content-ID oficial utilizado: " +
+                            detectedContentId
                     )
-
-                    fileLog(
-                        "URL final: ${response.request.url}"
-                    )
-
-                    fileLog(
-                        "Content-Type: ${
-                            response.header("Content-Type")
-                                ?: "(não informado)"
-                        }"
-                    )
-
-                    val contentRange =
-                        response.header("Content-Range")
-
-                    fileLog(
-                        "Content-Range: ${
-                            contentRange ?: "(não informado)"
-                        }"
-                    )
-
-                    val contentLength =
-                        response.header("Content-Length")
-
-                    fileLog(
-                        "Content-Length: ${
-                            contentLength ?: "(não informado)"
-                        }"
-                    )
-
-                    val stream: InputStream? =
-                        response.body?.byteStream()
-
-                    if (stream == null) {
-
-                        fileWarn(
-                            "Resposta remota não possui corpo."
-                        )
-
-                    } else {
-
-                        // ------------------------------------------------
-                        // LER EXATAMENTE O CABEÇALHO NECESSÁRIO
-                        // ------------------------------------------------
-
-                        val headerBytes =
-                            ByteArray(PKG_HEADER_SIZE)
-
-                        var bytesRead = 0
-
-                        while (
-                            bytesRead < PKG_HEADER_SIZE
-                        ) {
-
-                            val count =
-                                stream.read(
-                                    headerBytes,
-                                    bytesRead,
-                                    PKG_HEADER_SIZE - bytesRead
-                                )
-
-                            if (count == -1) {
-                                break
-                            }
-
-                            if (count == 0) {
-                                break
-                            }
-
-                            bytesRead += count
-                        }
-
-                        fileLog(
-                            "Bytes recebidos para inspeção: $bytesRead"
-                        )
-
-                        // ------------------------------------------------
-                        // PRIMEIROS BYTES PARA DIAGNÓSTICO
-                        // ------------------------------------------------
-
-                        if (bytesRead >= 4) {
-
-                            val firstBytes =
-                                headerBytes
-                                    .copyOfRange(
-                                        0,
-                                        minOf(bytesRead, 16)
-                                    )
-
-                            val firstHex =
-                                firstBytes.joinToString("") {
-                                    "%02X".format(
-                                        it.toInt() and 0xFF
-                                    )
-                                }
-
-                            fileLog(
-                                "Primeiros bytes HEX: $firstHex"
-                            )
-                        }
-
-                        // ------------------------------------------------
-                        // VALIDAR MAGIC DO PKG
-                        // ------------------------------------------------
-
-                        var validPkg = false
-
-                        if (bytesRead >= 4) {
-
-                            val magic =
-                                ByteBuffer
-                                    .wrap(
-                                        headerBytes,
-                                        0,
-                                        4
-                                    )
-                                    .order(
-                                        ByteOrder.BIG_ENDIAN
-                                    )
-                                    .int
-                                    .toLong() and
-                                    0xFFFFFFFFL
-
-                            fileLog(
-                                "PKG MAGIC recebido: " +
-                                    "0x${magic.toString(16).uppercase()}"
-                            )
-
-                            fileLog(
-                                "PKG MAGIC esperado: " +
-                                    "0x${PKG_MAGIC.toString(16).uppercase()}"
-                            )
-
-                            validPkg =
-                                magic == PKG_MAGIC
-
-                            if (validPkg) {
-
-                                fileLog(
-                                    "PKG válido: SIM"
-                                )
-
-                            } else {
-
-                                fileWarn(
-                                    "PKG válido: NÃO"
-                                )
-
-                                fileWarn(
-                                    "A resposta remota não começa " +
-                                        "com o MAGIC esperado de um PKG."
-                                )
-
-                                fileWarn(
-                                    "O Content-ID recebido da interface " +
-                                        "será preservado."
-                                )
-                            }
-
-                        } else {
-
-                            fileWarn(
-                                "Não foi possível ler nem os 4 primeiros " +
-                                    "bytes da resposta remota."
-                            )
-                        }
-
-                        // =================================================
-                        // SOMENTE PKG VÁLIDO PODE SOBRESCREVER METADADOS
-                        // =================================================
-
-                        if (validPkg) {
-
-                            // ------------------------------------------------
-                            // CONTENT ID
-                            // ------------------------------------------------
-
-                            if (
-                                bytesRead >=
-                                CONTENT_ID_OFFSET +
-                                CONTENT_ID_LENGTH
-                            ) {
-
-                                val pkgContentId =
-                                    String(
-                                        headerBytes,
-                                        CONTENT_ID_OFFSET,
-                                        CONTENT_ID_LENGTH,
-                                        Charsets.US_ASCII
-                                    )
-                                        .trim(
-                                            '\u0000',
-                                            ' ',
-                                            '\t',
-                                            '\r',
-                                            '\n'
-                                        )
-
-                                fileLog(
-                                    "Content-ID encontrado no PKG: " +
-                                        pkgContentId
-                                )
-
-                                if (
-                                    isValidContentId(
-                                        pkgContentId
-                                    )
-                                ) {
-
-                                    detectedContentId =
-                                        pkgContentId
-
-                                    fileLog(
-                                        "Content-ID oficial utilizado: " +
-                                            detectedContentId
-                                    )
-
-                                } else {
-
-                                    fileWarn(
-                                        "Content-ID encontrado no PKG " +
-                                            "não passou na validação: " +
-                                            pkgContentId
-                                    )
-
-                                    fileLog(
-                                        "Content-ID informado pela " +
-                                            "interface será preservado: " +
-                                            detectedContentId
-                                    )
-                                }
-
-                            } else {
-
-                                fileWarn(
-                                    "Cabeçalho insuficiente para " +
-                                        "extrair Content-ID."
-                                )
-                            }
-
-                            // ------------------------------------------------
-                            // DIGEST
-                            // ------------------------------------------------
-
-                            if (
-                                bytesRead >=
-                                DIGEST_OFFSET + DIGEST_LENGTH
-                            ) {
-
-                                realDigest =
-                                    headerBytes
-                                        .copyOfRange(
-                                            DIGEST_OFFSET,
-                                            DIGEST_OFFSET +
-                                                DIGEST_LENGTH
-                                        )
-                                        .joinToString("") {
-                                            "%02X".format(
-                                                it.toInt() and 0xFF
-                                            )
-                                        }
-
-                                fileLog(
-                                    "Digest PKG extraído: " +
-                                        realDigest
-                                )
-
-                            } else {
-
-                                fileWarn(
-                                    "Cabeçalho insuficiente para " +
-                                        "extrair o Digest."
-                                )
-                            }
-
-                            // ------------------------------------------------
-                            // TAMANHO
-                            // ------------------------------------------------
-
-                            val totalLength =
-                                contentRange
-                                    ?.substringAfterLast("/")
-                                    ?.toLongOrNull()
-                                    ?: contentLength
-                                        ?.toLongOrNull()
-                                    ?: 0L
-
-                            if (totalLength > 0L) {
-
-                                realFileSize =
-                                    totalLength
-
-                                fileLog(
-                                    "Tamanho exato informado pelo " +
-                                        "servidor remoto: " +
-                                        "$realFileSize bytes"
-                                )
-                            }
-
-                        } else {
-
-                            /*
-                             * MUITO IMPORTANTE:
-                             *
-                             * Não usamos Content-Length de uma página HTML
-                             * como tamanho do PKG.
-                             *
-                             * Mantemos o tamanho recebido pela interface.
-                             */
-
-                            fileWarn(
-                                "Metadados remotos ignorados porque " +
-                                    "a resposta não é um PKG válido."
-                            )
-
-                            fileLog(
-                                "Tamanho preservado da interface: " +
-                                    "$realFileSize bytes"
-                            )
-
-                            fileLog(
-                                "Content-ID preservado da interface: " +
-                                    detectedContentId
-                            )
-
-                            /*
-                             * O digest também permanece zerado.
-                             */
-                            realDigest =
-                                "0".repeat(64)
-                        }
-                    }
                 }
 
-        } catch (e: Exception) {
+                if (
+                    metadata.fileSize > 0L
+                ) {
 
-            fileWarn(
-                "Falha ao obter metadados remotos: " +
-                    "${e.message}"
-            )
+                    realFileSize =
+                        metadata.fileSize
 
-            /*
-             * Se a consulta remota falhar completamente,
-             * NÃO apagamos o Content-ID fornecido pela interface.
-             */
+                    fileLog(
+                        "Tamanho atualizado pelo PKG: " +
+                            realFileSize
+                    )
+                }
 
-            fileLog(
-                "Content-ID preservado após falha remota: " +
-                    detectedContentId
-            )
+                if (
+                    metadata.digest.length == 64
+                ) {
 
-            fileLog(
-                "Tamanho preservado após falha remota: " +
-                    realFileSize
-            )
+                    realDigest =
+                        metadata.digest
+
+                    fileLog(
+                        "Digest atualizado pelo PKG: " +
+                            realDigest
+                    )
+                }
+
+            } else {
+
+                fileWarn(
+                    "A resposta remota NÃO é um PKG válido."
+                )
+
+                fileWarn(
+                    "Content-ID original será preservado."
+                )
+
+                fileLog(
+                    "Content-ID preservado: " +
+                        detectedContentId
+                )
+
+                fileLog(
+                    "Tamanho preservado: " +
+                        realFileSize
+                )
+
+                realDigest =
+                    "0".repeat(64)
+            }
         }
 
-        // ================================================================
-        // CONTENT ID FINAL
-        // ================================================================
+        // ============================================================
+        // CONTENT-ID FINAL
+        // ============================================================
 
         val finalContentId =
             if (
@@ -759,11 +516,6 @@ class LocalBridgeServer(
 
             } else {
 
-                /*
-                 * Se a interface também não forneceu um Content-ID
-                 * válido, usamos fallback apenas para evitar crash.
-                 */
-
                 val fallback =
                     "CUSA" +
                         System.currentTimeMillis()
@@ -771,7 +523,8 @@ class LocalBridgeServer(
                             .takeLast(5)
 
                 fileWarn(
-                    "Nenhum Content-ID válido foi encontrado."
+                    "Content-ID recebido não passou na validação: " +
+                        detectedContentId
                 )
 
                 fileWarn(
@@ -782,17 +535,22 @@ class LocalBridgeServer(
             }
 
         fileLog(
-            "Content-ID FINAL: $finalContentId"
+            "Content-ID FINAL: " +
+                finalContentId
         )
 
-        // ================================================================
-        // TAMANHO FINAL
-        // ================================================================
+        // ============================================================
+        // TAMANHO
+        // ============================================================
 
-        if (realFileSize <= 0L) {
+        if (
+            realFileSize <= 0L
+        ) {
 
             realFileSize =
-                1024L * 1024L * 500L
+                1024L *
+                    1024L *
+                    500L
 
             fileWarn(
                 "Tamanho não encontrado."
@@ -803,9 +561,9 @@ class LocalBridgeServer(
             )
         }
 
-        // ================================================================
+        // ============================================================
         // IP LOCAL
-        // ================================================================
+        // ============================================================
 
         val localIp =
             getLocalWifiAddress()
@@ -827,25 +585,25 @@ class LocalBridgeServer(
             "IP Wi-Fi do Android: $localIp"
         )
 
-        // ================================================================
+        // ============================================================
         // CACHE DA URL REMOTA
-        // ================================================================
+        // ============================================================
 
         pkgUrlCache[
             finalContentId
         ] = directPkgUrl
 
         fileLog(
-            "URL remota associada ao Content-ID:"
+            "URL remota associada:"
         )
 
         fileLog(
             "$finalContentId -> $directPkgUrl"
         )
 
-        // ================================================================
+        // ============================================================
         // URL LOCAL DO PKG
-        // ================================================================
+        // ============================================================
 
         val localPkgUrl =
             "http://$localIp:$port/download-pkg/$finalContentId"
@@ -854,9 +612,9 @@ class LocalBridgeServer(
             "URL local do PKG: $localPkgUrl"
         )
 
-        // ================================================================
+        // ============================================================
         // MANIFESTO
-        // ================================================================
+        // ============================================================
 
         val manifestJsonString =
             JSONObject().apply {
@@ -928,10 +686,6 @@ class LocalBridgeServer(
                 finalContentId
         )
 
-        // ================================================================
-        // URL DO MANIFESTO
-        // ================================================================
-
         val localManifestUrl =
             "http://$localIp:$port/manifest/$finalContentId.json"
 
@@ -940,9 +694,9 @@ class LocalBridgeServer(
                 localManifestUrl
         )
 
-        // ================================================================
+        // ============================================================
         // PAYLOADER
-        // ================================================================
+        // ============================================================
 
         fileLog("========================================")
         fileLog("DISPARANDO PAYLOADER")
@@ -970,7 +724,9 @@ class LocalBridgeServer(
                 )
             }
 
-        if (result.isSuccess) {
+        if (
+            result.isSuccess
+        ) {
 
             fileLog(
                 "PAYLOADER FINALIZADO COM SUCESSO."
@@ -991,9 +747,9 @@ class LocalBridgeServer(
             )
         }
 
-        // ================================================================
-        // RESPOSTA PARA A INTERFACE
-        // ================================================================
+        // ============================================================
+        // RESPOSTA
+        // ============================================================
 
         val responseJson =
             JSONObject().apply {
@@ -1013,7 +769,9 @@ class LocalBridgeServer(
                     localManifestUrl
                 )
 
-                if (result.isFailure) {
+                if (
+                    result.isFailure
+                ) {
 
                     put(
                         "error",
@@ -1048,7 +806,646 @@ class LocalBridgeServer(
     }
 
     // ================================================================
-    // VALIDAÇÃO DO CONTENT ID
+    // INSPEÇÃO REMOTA
+    // ================================================================
+
+    private fun inspectRemotePackage(
+        directPkgUrl: String,
+        initialContentId: String
+    ): RemotePkgMetadata? {
+
+        fileLog("========================================")
+        fileLog("DIAGNÓSTICO REMOTO DO PKG")
+        fileLog("URL original:")
+        fileLog(directPkgUrl)
+        fileLog("Content-ID recebido:")
+        fileLog(initialContentId)
+        fileLog("========================================")
+
+        return try {
+
+            val request =
+                Request.Builder()
+                    .url(directPkgUrl)
+
+                    /*
+                     * O mesmo User-Agent usado posteriormente
+                     * no streaming para manter o comportamento
+                     * consistente.
+                     */
+                    .addHeader(
+                        "User-Agent",
+                        "PlayStation 4"
+                    )
+
+                    .addHeader(
+                        "Accept",
+                        "application/octet-stream,*/*"
+                    )
+
+                    .addHeader(
+                        "Accept-Encoding",
+                        "identity"
+                    )
+
+                    .addHeader(
+                        "Range",
+                        "bytes=0-4095"
+                    )
+
+                    .build()
+
+            fileLog(
+                "Enviando requisição Range..."
+            )
+
+            proxyClient
+                .newCall(request)
+                .execute()
+                .use { response ->
+
+                    fileLog(
+                        "HTTP: ${response.code}"
+                    )
+
+                    fileLog(
+                        "Mensagem HTTP: ${response.message}"
+                    )
+
+                    fileLog(
+                        "URL original da requisição: " +
+                            request.url
+                    )
+
+                    fileLog(
+                        "URL final após redirects: " +
+                            response.request.url
+                    )
+
+                    val contentType =
+                        response.header(
+                            "Content-Type"
+                        )
+
+                    val contentLength =
+                        response.header(
+                            "Content-Length"
+                        )
+
+                    val contentRange =
+                        response.header(
+                            "Content-Range"
+                        )
+
+                    val location =
+                        response.header(
+                            "Location"
+                        )
+
+                    fileLog(
+                        "Content-Type: " +
+                            (
+                                contentType
+                                    ?: "(não informado)"
+                                )
+                    )
+
+                    fileLog(
+                        "Content-Length: " +
+                            (
+                                contentLength
+                                    ?: "(não informado)"
+                                )
+                    )
+
+                    fileLog(
+                        "Content-Range: " +
+                            (
+                                contentRange
+                                    ?: "(não informado)"
+                                )
+                    )
+
+                    if (
+                        location != null
+                    ) {
+
+                        fileLog(
+                            "Location: $location"
+                        )
+                    }
+
+                    fileLog(
+                        "Resposta bem-sucedida: " +
+                            response.isSuccessful
+                    )
+
+                    val body =
+                        response.body
+
+                    if (body == null) {
+
+                        fileWarn(
+                            "Servidor remoto não retornou body."
+                        )
+
+                        return@use RemotePkgMetadata.invalid(
+                            initialContentId
+                        )
+                    }
+
+                    // ====================================================
+                    // LER PRIMEIROS 4096 BYTES
+                    // ====================================================
+
+                    val headerBytes =
+                        ByteArray(
+                            PKG_HEADER_SIZE
+                        )
+
+                    var bytesRead = 0
+
+                    val stream =
+                        body.byteStream()
+
+                    while (
+                        bytesRead <
+                        PKG_HEADER_SIZE
+                    ) {
+
+                        val count =
+                            stream.read(
+                                headerBytes,
+                                bytesRead,
+                                PKG_HEADER_SIZE -
+                                    bytesRead
+                            )
+
+                        if (
+                            count == -1
+                        ) {
+                            break
+                        }
+
+                        if (
+                            count == 0
+                        ) {
+                            break
+                        }
+
+                        bytesRead += count
+                    }
+
+                    fileLog(
+                        "Bytes recebidos para diagnóstico: " +
+                            bytesRead
+                    )
+
+                    if (
+                        bytesRead <= 0
+                    ) {
+
+                        fileWarn(
+                            "Resposta remota sem dados."
+                        )
+
+                        return@use RemotePkgMetadata.invalid(
+                            initialContentId
+                        )
+                    }
+
+                    // ====================================================
+                    // HEX
+                    // ====================================================
+
+                    val previewLength =
+                        minOf(
+                            bytesRead,
+                            64
+                        )
+
+                    val previewBytes =
+                        headerBytes
+                            .copyOfRange(
+                                0,
+                                previewLength
+                            )
+
+                    val previewHex =
+                        previewBytes.joinToString(
+                            separator = " "
+                        ) {
+
+                            "%02X".format(
+                                it.toInt() and 0xFF
+                            )
+                        }
+
+                    fileLog(
+                        "Primeiros bytes HEX:"
+                    )
+
+                    fileLog(
+                        previewHex
+                    )
+
+                    // ====================================================
+                    // TEXTO
+                    // ====================================================
+
+                    val textPreview =
+                        headerBytes
+                            .copyOfRange(
+                                0,
+                                minOf(
+                                    bytesRead,
+                                    512
+                                )
+                            )
+                            .toString(
+                                Charsets.UTF_8
+                            )
+                            .replace(
+                                Regex(
+                                    "[^\\x20-\\x7E\\r\\n\\t]"
+                                ),
+                                "."
+                            )
+
+                    fileLog(
+                        "Prévia textual da resposta:"
+                    )
+
+                    fileLog(
+                        textPreview
+                    )
+
+                    // ====================================================
+                    // HTML
+                    // ====================================================
+
+                    val normalizedContentType =
+                        contentType
+                            ?.lowercase()
+                            ?: ""
+
+                    val appearsHtml =
+                        normalizedContentType
+                            .contains("text/html") ||
+                            normalizedContentType
+                                .contains("application/xhtml")
+
+                    if (
+                        appearsHtml
+                    ) {
+
+                        fileWarn(
+                            "ATENÇÃO: servidor remoto " +
+                                "respondeu HTML."
+                        )
+
+                        fileWarn(
+                            "A URL fornecida não está entregando " +
+                                "um PKG diretamente nesta requisição."
+                        )
+
+                        logHtmlDiagnostics(
+                            headerBytes,
+                            bytesRead
+                        )
+                    }
+
+                    // ====================================================
+                    // MAGIC
+                    // ====================================================
+
+                    if (
+                        bytesRead < 4
+                    ) {
+
+                        fileWarn(
+                            "Menos de 4 bytes recebidos."
+                        )
+
+                        return@use RemotePkgMetadata.invalid(
+                            initialContentId
+                        )
+                    }
+
+                    val magic =
+                        ByteBuffer
+                            .wrap(
+                                headerBytes,
+                                0,
+                                4
+                            )
+                            .order(
+                                ByteOrder.BIG_ENDIAN
+                            )
+                            .int
+                            .toLong() and
+                            0xFFFFFFFFL
+
+                    fileLog(
+                        "MAGIC recebido: " +
+                            "0x${magic.toString(16).uppercase()}"
+                    )
+
+                    fileLog(
+                        "MAGIC esperado: " +
+                            "0x${PKG_MAGIC.toString(16).uppercase()}"
+                    )
+
+                    val validPkg =
+                        magic == PKG_MAGIC
+
+                    if (!validPkg) {
+
+                        fileWarn(
+                            "========================================"
+                        )
+
+                        fileWarn(
+                            "RESPOSTA REMOTA NÃO É UM PKG"
+                        )
+
+                        fileWarn(
+                            "O Content-ID da interface será preservado."
+                        )
+
+                        fileWarn(
+                            "========================================"
+                        )
+
+                        return@use RemotePkgMetadata.invalid(
+                            initialContentId
+                        )
+                    }
+
+                    fileLog(
+                        "PKG MAGIC válido."
+                    )
+
+                    // ====================================================
+                    // CONTENT ID
+                    // ====================================================
+
+                    var pkgContentId = ""
+
+                    if (
+                        bytesRead >=
+                        CONTENT_ID_OFFSET +
+                        CONTENT_ID_LENGTH
+                    ) {
+
+                        pkgContentId =
+                            String(
+                                headerBytes,
+                                CONTENT_ID_OFFSET,
+                                CONTENT_ID_LENGTH,
+                                Charsets.US_ASCII
+                            )
+                                .trim(
+                                    '\u0000',
+                                    ' ',
+                                    '\t',
+                                    '\r',
+                                    '\n'
+                                )
+
+                        fileLog(
+                            "Content-ID extraído: " +
+                                pkgContentId
+                        )
+
+                    } else {
+
+                        fileWarn(
+                            "Cabeçalho insuficiente para Content-ID."
+                        )
+                    }
+
+                    if (
+                        !isValidContentId(
+                            pkgContentId
+                        )
+                    ) {
+
+                        fileWarn(
+                            "Content-ID do PKG não passou na validação."
+                        )
+
+                        fileWarn(
+                            "Valor encontrado: $pkgContentId"
+                        )
+
+                        pkgContentId =
+                            initialContentId
+                    }
+
+                    // ====================================================
+                    // DIGEST
+                    // ====================================================
+
+                    var digest =
+                        "0".repeat(64)
+
+                    if (
+                        bytesRead >=
+                        DIGEST_OFFSET +
+                        DIGEST_LENGTH
+                    ) {
+
+                        digest =
+                            headerBytes
+                                .copyOfRange(
+                                    DIGEST_OFFSET,
+                                    DIGEST_OFFSET +
+                                        DIGEST_LENGTH
+                                )
+                                .joinToString("") {
+
+                                    "%02X".format(
+                                        it.toInt() and 0xFF
+                                    )
+                                }
+
+                        fileLog(
+                            "Digest extraído: $digest"
+                        )
+
+                    } else {
+
+                        fileWarn(
+                            "Cabeçalho insuficiente para Digest."
+                        )
+                    }
+
+                    // ====================================================
+                    // TAMANHO
+                    // ====================================================
+
+                    val totalLength =
+                        contentRange
+                            ?.substringAfterLast("/")
+                            ?.toLongOrNull()
+                            ?: contentLength
+                                ?.toLongOrNull()
+                            ?: 0L
+
+                    fileLog(
+                        "Tamanho remoto detectado: " +
+                            totalLength
+                    )
+
+                    RemotePkgMetadata(
+                        isValidPkg = true,
+                        contentId = pkgContentId,
+                        fileSize = totalLength,
+                        digest = digest
+                    )
+                }
+
+        } catch (e: Exception) {
+
+            fileError(
+                "Erro durante diagnóstico remoto: " +
+                    e.message,
+                e
+            )
+
+            RemotePkgMetadata.invalid(
+                initialContentId
+            )
+        }
+    }
+
+    // ================================================================
+    // DIAGNÓSTICO DE HTML
+    // ================================================================
+
+    private fun logHtmlDiagnostics(
+        bytes: ByteArray,
+        length: Int
+    ) {
+
+        if (
+            length <= 0
+        ) {
+            return
+        }
+
+        val sampleLength =
+            minOf(
+                length,
+                MAX_HTML_LOG
+            )
+
+        val sample =
+            bytes
+                .copyOfRange(
+                    0,
+                    sampleLength
+                )
+                .toString(
+                    Charsets.UTF_8
+                )
+                .replace(
+                    Regex(
+                        "[^\\x20-\\x7E\\r\\n\\t]"
+                    ),
+                    ""
+                )
+
+        fileLog(
+            "========================================"
+        )
+
+        fileLog(
+            "DIAGNÓSTICO DA RESPOSTA HTML"
+        )
+
+        fileLog(
+            "Tamanho da amostra: $sampleLength bytes"
+        )
+
+        fileLog(
+            sample
+        )
+
+        fileLog(
+            "========================================"
+        )
+
+        val lower =
+            sample.lowercase()
+
+        if (
+            lower.contains("cloudflare")
+        ) {
+
+            fileWarn(
+                "A resposta HTML contém referência a Cloudflare."
+            )
+        }
+
+        if (
+            lower.contains("captcha")
+        ) {
+
+            fileWarn(
+                "A resposta HTML contém referência a CAPTCHA."
+            )
+        }
+
+        if (
+            lower.contains("verify you are human")
+        ) {
+
+            fileWarn(
+                "A resposta HTML parece ser uma verificação anti-bot."
+            )
+        }
+
+        if (
+            lower.contains("access denied")
+        ) {
+
+            fileWarn(
+                "A resposta HTML indica ACCESS DENIED."
+            )
+        }
+
+        if (
+            lower.contains("forbidden")
+        ) {
+
+            fileWarn(
+                "A resposta HTML indica FORBIDDEN."
+            )
+        }
+
+        if (
+            lower.contains("login")
+        ) {
+
+            fileWarn(
+                "A resposta HTML contém indicação de LOGIN."
+            )
+        }
+
+        if (
+            lower.contains("download")
+        ) {
+
+            fileLog(
+                "A página HTML contém referência a DOWNLOAD."
+            )
+        }
+    }
+
+    // ================================================================
+    // VALIDAÇÃO DO CONTENT-ID
     // ================================================================
 
     private fun isValidContentId(
@@ -1058,7 +1455,10 @@ class LocalBridgeServer(
         val id =
             contentId.trim()
 
-        if (id.length != CONTENT_ID_LENGTH) {
+        if (
+            id.length !=
+            CONTENT_ID_LENGTH
+        ) {
             return false
         }
 
@@ -1070,25 +1470,18 @@ class LocalBridgeServer(
             return false
         }
 
-        if (!id.contains("-")) {
+        if (
+            !id.contains("-")
+        ) {
             return false
         }
-
-        /*
-         * Content-ID PS4 normalmente começa com um
-         * prefixo de quatro caracteres, seguido por "-".
-         *
-         * Exemplos:
-         *
-         * EP0002-CUSA00184_00-ANGRYBSTARWARSDL
-         * UP0001-CUSA...
-         * NP...
-         */
 
         val prefix =
             id.substringBefore("-")
 
-        if (prefix.length < 4) {
+        if (
+            prefix.length < 4
+        ) {
             return false
         }
 
@@ -1115,7 +1508,9 @@ class LocalBridgeServer(
             session.uri
 
         val idFromPath =
-            if (uri.startsWith("/manifest/")) {
+            if (
+                uri.startsWith("/manifest/")
+            ) {
 
                 val raw =
                     uri
@@ -1123,15 +1518,19 @@ class LocalBridgeServer(
                         .removeSuffix(".json")
 
                 try {
+
                     URLDecoder.decode(
                         raw,
                         "UTF-8"
                     )
+
                 } catch (_: Exception) {
+
                     raw
                 }
 
             } else {
+
                 null
             }
 
@@ -1142,17 +1541,29 @@ class LocalBridgeServer(
                 ?: lastContentId
 
         fileLog(
-            "PS4 solicitou manifesto: $requestId"
+            "PS4 solicitou manifesto: " +
+                requestId
         )
 
         val manifest =
-            if (!requestId.isNullOrBlank()) {
-                manifestCache[requestId]
+            if (
+                !requestId.isNullOrBlank()
+            ) {
+
+                manifestCache[
+                    requestId
+                ]
+
             } else {
-                manifestCache.values.lastOrNull()
+
+                manifestCache
+                    .values
+                    .lastOrNull()
             }
 
-        return if (manifest != null) {
+        return if (
+            manifest != null
+        ) {
 
             fileLog(
                 "Manifesto entregue com sucesso ao PS4: " +
@@ -1171,7 +1582,8 @@ class LocalBridgeServer(
         } else {
 
             fileWarn(
-                "Manifesto inexistente para: $requestId"
+                "Manifesto inexistente para: " +
+                    requestId
             )
 
             addCors(
@@ -1186,7 +1598,7 @@ class LocalBridgeServer(
     }
 
     // ================================================================
-    // PROXY DO PKG
+    // STREAMING DO PKG
     // ================================================================
 
     private fun handleProxyPkg(
@@ -1195,25 +1607,34 @@ class LocalBridgeServer(
 
         val rawContentId =
             session.uri
-                .removePrefix("/download-pkg/")
+                .removePrefix(
+                    "/download-pkg/"
+                )
 
         val contentId =
             try {
+
                 URLDecoder.decode(
                     rawContentId,
                     "UTF-8"
                 )
+
             } catch (_: Exception) {
+
                 rawContentId
             }
 
         val remoteUrl =
-            pkgUrlCache[contentId]
+            pkgUrlCache[
+                contentId
+            ]
 
-        if (remoteUrl.isNullOrBlank()) {
+        if (
+            remoteUrl.isNullOrBlank()
+        ) {
 
             fileWarn(
-                "URL remota do PKG não encontrada para contentId: " +
+                "URL remota do PKG não encontrada para: " +
                     contentId
             )
 
@@ -1225,11 +1646,36 @@ class LocalBridgeServer(
         }
 
         val rangeHeader =
-            session.headers["range"]
+            session.headers[
+                "range"
+            ]
 
         fileLog(
-            "PS4 solicitou bloco para [$contentId] | " +
-                "Range: ${rangeHeader ?: "Completo"}"
+            "========================================"
+        )
+
+        fileLog(
+            "STREAMING DO PKG"
+        )
+
+        fileLog(
+            "Content-ID: $contentId"
+        )
+
+        fileLog(
+            "URL remota: $remoteUrl"
+        )
+
+        fileLog(
+            "Range solicitado pelo PS4: " +
+                (
+                    rangeHeader
+                        ?: "Completo"
+                    )
+        )
+
+        fileLog(
+            "========================================"
         )
 
         val requestBuilder =
@@ -1243,8 +1689,14 @@ class LocalBridgeServer(
                     "Accept",
                     "application/octet-stream,*/*"
                 )
+                .addHeader(
+                    "Accept-Encoding",
+                    "identity"
+                )
 
-        if (!rangeHeader.isNullOrBlank()) {
+        if (
+            !rangeHeader.isNullOrBlank()
+        ) {
 
             requestBuilder.addHeader(
                 "Range",
@@ -1264,6 +1716,149 @@ class LocalBridgeServer(
             val responseBody =
                 remoteResponse.body
 
+            fileLog(
+                "Servidor remoto respondeu HTTP " +
+                    remoteResponse.code
+            )
+
+            fileLog(
+                "URL final do streaming: " +
+                    remoteResponse.request.url
+            )
+
+            val remoteContentType =
+                remoteResponse.header(
+                    "Content-Type"
+                )
+
+            val remoteContentRange =
+                remoteResponse.header(
+                    "Content-Range"
+                )
+
+            fileLog(
+                "Content-Type remoto: " +
+                    (
+                        remoteContentType
+                            ?: "(não informado)"
+                        )
+            )
+
+            fileLog(
+                "Content-Range remoto: " +
+                    (
+                        remoteContentRange
+                            ?: "(não informado)"
+                        )
+            )
+
+            fileLog(
+                "Content-Length remoto: " +
+                    (
+                        remoteResponse
+                            .header("Content-Length")
+                            ?: "(não informado)"
+                        )
+            )
+
+            // ------------------------------------------------------------
+            // SE O STREAMING RECEBER HTML
+            // ------------------------------------------------------------
+
+            if (
+                remoteContentType
+                    ?.lowercase()
+                    ?.contains("text/html") == true
+            ) {
+
+                fileWarn(
+                    "========================================"
+                )
+
+                fileWarn(
+                    "ERRO CRÍTICO NO STREAMING"
+                )
+
+                fileWarn(
+                    "O servidor remoto está devolvendo HTML " +
+                        "no lugar do PKG."
+                )
+
+                fileWarn(
+                    "========================================"
+                )
+
+                /*
+                 * Neste ponto não consumimos o body inteiro.
+                 * Apenas lemos uma pequena amostra para diagnóstico.
+                 */
+
+                if (
+                    responseBody != null
+                ) {
+
+                    try {
+
+                        val sample =
+                            responseBody
+                                .byteStream()
+                                .use { input ->
+
+                                    val buffer =
+                                        ByteArray(1024)
+
+                                    val count =
+                                        input.read(
+                                            buffer
+                                        )
+
+                                    if (
+                                        count > 0
+                                    ) {
+
+                                        buffer
+                                            .copyOf(count)
+                                            .toString(
+                                                Charsets.UTF_8
+                                            )
+                                            .replace(
+                                                Regex(
+                                                    "[^\\x20-\\x7E\\r\\n\\t]"
+                                                ),
+                                                ""
+                                            )
+
+                                    } else {
+                                        ""
+                                    }
+                                }
+
+                        fileWarn(
+                            "Prévia HTML do streaming:"
+                        )
+
+                        fileWarn(
+                            sample
+                        )
+
+                    } catch (e: Exception) {
+
+                        fileWarn(
+                            "Não foi possível obter prévia HTML: " +
+                                e.message
+                        )
+                    }
+                }
+
+                remoteResponse.close()
+
+                return newFixedLengthResponse(
+                    Response.Status.BAD_GATEWAY,
+                    "text/plain",
+                    "Servidor remoto devolveu HTML em vez do PKG"
+                )
+            }
+
             if (
                 !remoteResponse.isSuccessful ||
                 responseBody == null
@@ -1271,7 +1866,7 @@ class LocalBridgeServer(
 
                 fileError(
                     "Servidor remoto recusou a requisição. " +
-                        "Código HTTP: ${remoteResponse.code}"
+                        "HTTP ${remoteResponse.code}"
                 )
 
                 remoteResponse.close()
@@ -1284,60 +1879,25 @@ class LocalBridgeServer(
             }
 
             val contentType =
-                remoteResponse.header(
-                    "Content-Type"
-                ) ?: "application/octet-stream"
+                remoteContentType
+                    ?: "application/octet-stream"
 
             val contentRange =
-                remoteResponse.header(
-                    "Content-Range"
-                )
+                remoteContentRange
 
             val contentLength =
                 responseBody.contentLength()
-
-            fileLog(
-                "Resposta remota do PKG: HTTP " +
-                    remoteResponse.code
-            )
-
-            fileLog(
-                "Content-Type remoto: $contentType"
-            )
-
-            fileLog(
-                "Content-Range remoto: " +
-                    (contentRange ?: "(não informado)")
-            )
-
-            fileLog(
-                "Content-Length remoto: " +
-                    contentLength
-            )
-
-            /*
-             * Se a resposta veio 200 para um pedido Range,
-             * registramos isso explicitamente.
-             */
-
-            if (
-                rangeHeader != null &&
-                remoteResponse.code == 200 &&
-                contentRange == null
-            ) {
-
-                fileWarn(
-                    "Servidor remoto ignorou o Range solicitado."
-                )
-            }
 
             val status =
                 if (
                     remoteResponse.code == 206 ||
                     contentRange != null
                 ) {
+
                     Response.Status.PARTIAL_CONTENT
+
                 } else {
+
                     Response.Status.OK
                 }
 
@@ -1354,7 +1914,9 @@ class LocalBridgeServer(
                 "bytes"
             )
 
-            if (!contentRange.isNullOrBlank()) {
+            if (
+                !contentRange.isNullOrBlank()
+            ) {
 
                 nanoResponse.addHeader(
                     "Content-Range",
@@ -1363,7 +1925,7 @@ class LocalBridgeServer(
 
                 fileLog(
                     "Retransmitindo Content-Range: " +
-                        "$contentRange ($contentLength bytes)"
+                        "$contentRange"
                 )
             }
 
@@ -1375,8 +1937,8 @@ class LocalBridgeServer(
         } catch (e: Exception) {
 
             fileError(
-                "Interrupção durante streaming do PKG " +
-                    "para o PS4: ${e.message}",
+                "Interrupção durante streaming do PKG: " +
+                    e.message,
                 e
             )
 
@@ -1445,8 +2007,11 @@ class LocalBridgeServer(
                 !session.queryParameterString
                     .isNullOrBlank()
             ) {
+
                 "?${session.queryParameterString}"
+
             } else {
+
                 ""
             }
 
@@ -1461,7 +2026,9 @@ class LocalBridgeServer(
             Request.Builder()
                 .url(targetUrl)
 
-        when (session.method) {
+        when (
+            session.method
+        ) {
 
             Method.POST -> {
 
@@ -1474,8 +2041,9 @@ class LocalBridgeServer(
                     map["postData"] ?: ""
 
                 val contentType =
-                    session.headers["content-type"]
-                        ?: "application/json"
+                    session.headers[
+                        "content-type"
+                    ] ?: "application/json"
 
                 requestBuilder.post(
                     bodyText.toRequestBody(
@@ -1495,8 +2063,9 @@ class LocalBridgeServer(
                     map["postData"] ?: ""
 
                 val contentType =
-                    session.headers["content-type"]
-                        ?: "application/json"
+                    session.headers[
+                        "content-type"
+                    ] ?: "application/json"
 
                 requestBuilder.put(
                     bodyText.toRequestBody(
@@ -1559,7 +2128,7 @@ class LocalBridgeServer(
     }
 
     // ================================================================
-    // IP LOCAL WI-FI
+    // IP WI-FI
     // ================================================================
 
     private fun getLocalWifiAddress(): String? {
@@ -1670,7 +2239,7 @@ class LocalBridgeServer(
     }
 
     // ================================================================
-    // ERRO JSON
+    // JSON ERROR
     // ================================================================
 
     private fun jsonError(
@@ -1704,7 +2273,33 @@ class LocalBridgeServer(
             )
         )
     }
-}
 
+    // ================================================================
+    // MODELO DE METADADOS REMOTOS
+    // ================================================================
+
+    private data class RemotePkgMetadata(
+        val isValidPkg: Boolean,
+        val contentId: String,
+        val fileSize: Long,
+        val digest: String
+    ) {
+
+        companion object {
+
+            fun invalid(
+                contentId: String
+            ): RemotePkgMetadata {
+
+                return RemotePkgMetadata(
+                    isValidPkg = false,
+                    contentId = contentId,
+                    fileSize = 0L,
+                    digest = "0".repeat(64)
+                )
+            }
+        }
+    }
+}
 
 
