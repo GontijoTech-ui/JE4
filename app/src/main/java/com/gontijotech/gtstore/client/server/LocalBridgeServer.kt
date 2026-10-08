@@ -14,7 +14,7 @@ import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.net.Inet4Address
 import java.net.NetworkInterface
-import java.util.HashMap
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 class LocalBridgeServer(
@@ -30,39 +30,41 @@ class LocalBridgeServer(
         .readTimeout(30, TimeUnit.SECONDS)
         .build()
 
-    // Inicializa o Payloader com o contexto para carregar assets/payload.bin
+    // Inicializa o Payloader
     private val payloader = Ps4Payloader(context)
 
-    // Cache em memória do último manifesto sincronizado
+    // Cache em memória chaveado por contentId para evitar race conditions
+    private val manifestCache = ConcurrentHashMap<String, String>()
+
     @Volatile
-    private var cachedManifestJson: String? = null
+    private var lastContentId: String? = null
 
     override fun serve(session: IHTTPSession): Response {
         val uri = session.uri
         val method = session.method
 
         if (method == Method.OPTIONS) {
-            return addCors(newFixedLengthResponse(Response.Status.OK, MIME_PLAINTEXT, ""))
+            return addCors(session, newFixedLengthResponse(Response.Status.OK, MIME_PLAINTEXT, ""))
         }
 
         return try {
             when {
-                // Rota local exclusiva acionada pela interface web para injeção
+                // Rota local para injeção via interface web
                 method == Method.POST && uri == "/api/local/inject" -> handleLocalInject(session)
 
-                // Rota local para entregar o manifesto JSON diretamente ao PS4 via Wi-Fi
-                method == Method.GET && uri == "/local-manifest.json" -> handleServeLocalManifest()
+                // Rota local para servir o manifesto BGFT ao PS4
+                method == Method.GET && uri == "/local-manifest.json" -> handleServeLocalManifest(session)
 
-                // Proxy do index.html originário do servidor Administrador na nuvem
-                uri == "/" || uri == "/index.html" -> handleProxyStatic("$adminHost/index.html", "text/html")
+                // Proxy da interface web (HTML)
+                uri == "/" || uri == "/index.html" -> handleProxyStatic("$adminHost/index.html", "text/html", session)
 
-                // Encaminhamento transparente de todas as outras rotas e recursos
+                // Encaminhamento transparente de assets e APIs remotas
                 else -> handleProxyForward(session)
             }
         } catch (e: Exception) {
-            Log.e(tag, "Erro no processamento da rota $uri: ${e.message}")
+            Log.e(tag, "Erro no processamento da rota $uri: ${e.message}", e)
             val err = JSONObject().put("error", e.message ?: "Erro interno no LocalBridgeServer").toString()
-            addCors(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json", err))
+            addCors(session, newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json", err))
         }
     }
 
@@ -71,27 +73,37 @@ class LocalBridgeServer(
         session.parseBody(map)
         val json = JSONObject(map["postData"] ?: "{}")
 
-        val ps4Ip = json.getString("ps4Ip")
+        val ps4Ip = json.optString("ps4Ip").trim()
+        if (ps4Ip.isEmpty()) {
+            return addCors(
+                session,
+                newFixedLengthResponse(
+                    Response.Status.BAD_REQUEST,
+                    "application/json",
+                    """{"success":false,"error":"O campo 'ps4Ip' é obrigatório."}"""
+                )
+            )
+        }
+
         val title = json.optString("title", "Jogo PS4")
-        val contentId = json.optString("contentId", "CUSA00000")
+        val contentId = json.optString("contentId", "CUSA00000").trim()
         val category = json.optString("category", "gd")
         val size = json.optLong("size", 0L)
 
-        // Obtém o link direto do arquivo .pkg vindo da interface
+        // Resgata link direto enviado pelo frontend
         val directPkgUrl = json.optString("packageUrl",
             json.optString("pkgUrl",
                 json.optString("url",
                     json.optString("directUrl", "")
                 )
             )
-        )
+        ).trim()
 
-        val rawManifestUrl = json.optString("manifestUrl", "")
+        val rawManifestUrl = json.optString("manifestUrl", "").trim()
 
-        // 1. Gera o manifesto local em memória ou busca remotamente se for rota legada
-        if (directPkgUrl.isNotEmpty() && (directPkgUrl.startsWith("http://") || directPkgUrl.startsWith("https://"))) {
-            // Gera a estrutura JSON padrão compatível com o BGFT da consola
-            cachedManifestJson = JSONObject().apply {
+        // 1. Gera ou busca o manifesto JSON
+        val manifestJsonString: String = if (directPkgUrl.isNotEmpty() && (directPkgUrl.startsWith("http://") || directPkgUrl.startsWith("https://"))) {
+            JSONObject().apply {
                 put("originalFileSize", size)
                 put("packageDigest", "")
                 put("numberOfSplitFiles", 1)
@@ -103,7 +115,6 @@ class LocalBridgeServer(
                     })
                 })
             }.toString()
-            Log.i(tag, "Manifesto gerado em memória RAM com sucesso para o pacote.")
         } else if (rawManifestUrl.isNotEmpty()) {
             val remoteManifestUrl = when {
                 rawManifestUrl.startsWith("http://") || rawManifestUrl.startsWith("https://") -> rawManifestUrl
@@ -113,61 +124,67 @@ class LocalBridgeServer(
 
             Log.i(tag, "Buscando manifesto remoto em: $remoteManifestUrl")
 
+            val req = Request.Builder().url(remoteManifestUrl).build()
             try {
-                val req = Request.Builder().url(remoteManifestUrl).build()
-                val resp = proxyClient.newCall(req).execute()
-
-                if (resp.isSuccessful) {
-                    cachedManifestJson = resp.body?.string()
-                    Log.i(tag, "Manifesto obtido e armazenado em cache local.")
-                } else {
-                    Log.w(tag, "Servidor retornou HTTP ${resp.code} ao buscar manifesto.")
-                    return addCors(
-                        newFixedLengthResponse(
-                            Response.Status.BAD_REQUEST,
-                            "application/json",
-                            JSONObject().apply {
-                                put("success", false)
-                                put("error", "Não foi possível obter os dados do jogo no servidor (HTTP ${resp.code})")
-                            }.toString()
+                proxyClient.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) {
+                        return addCors(
+                            session,
+                            newFixedLengthResponse(
+                                Response.Status.BAD_REQUEST,
+                                "application/json",
+                                """{"success":false,"error":"Servidor remoto retornou HTTP ${resp.code} ao buscar manifesto."}"""
+                            )
                         )
-                    )
+                    }
+                    resp.body?.string() ?: ""
                 }
             } catch (e: Exception) {
-                Log.e(tag, "Falha ao conectar com o Admin: ${e.message}")
                 return addCors(
+                    session,
                     newFixedLengthResponse(
                         Response.Status.INTERNAL_ERROR,
                         "application/json",
-                        JSONObject().apply {
-                            put("success", false)
-                            put("error", "Falha de rede ao sincronizar com o Admin: ${e.message}")
-                        }.toString()
+                        """{"success":false,"error":"Falha de rede ao buscar manifesto: ${e.message}"}"""
                     )
                 )
             }
         } else {
             return addCors(
+                session,
                 newFixedLengthResponse(
                     Response.Status.BAD_REQUEST,
                     "application/json",
-                    JSONObject().apply {
-                        put("success", false)
-                        put("error", "Nenhum link direto (packageUrl) configurado para este jogo.")
-                    }.toString()
+                    """{"success":false,"error":"Nenhum link direto (packageUrl) ou manifesto configurado."}"""
                 )
             )
         }
 
-        // 2. Determina o IP Wi-Fi local do telemóvel para a consola aceder
-        val localIp = getLocalWifiAddress() ?: "127.0.0.1"
-        val localManifestUrl = "http://$localIp:$port/local-manifest.json"
-        Log.i(tag, "URL local fornecida ao PS4: $localManifestUrl")
+        // Salva no cache concorrente
+        manifestCache[contentId] = manifestJsonString
+        lastContentId = contentId
 
-        // 3. Disparo integral via payload.bin com a URL local HTTP
+        // 2. Determina o IP Wi-Fi local do celular
+        val localIp = getLocalWifiAddress()
+        if (localIp == null) {
+            return addCors(
+                session,
+                newFixedLengthResponse(
+                    Response.Status.BAD_REQUEST,
+                    "application/json",
+                    """{"success":false,"error":"O aparelho não está conectado a uma rede Wi-Fi local válida."}"""
+                )
+            )
+        }
+
+        val localManifestUrl = "http://$localIp:$port/local-manifest.json?id=$contentId"
+        Log.i(tag, "Manifesto local disponível em: $localManifestUrl")
+
+        // 3. Disparo via Payloader
         val result = runBlocking {
             payloader.injectDpiPayload(
                 ps4Ip = ps4Ip,
+                localIp = localIp,
                 manifestUrl = localManifestUrl,
                 itemTitle = title,
                 contentId = contentId,
@@ -184,29 +201,33 @@ class LocalBridgeServer(
             }
         }.toString()
 
-        return addCors(newFixedLengthResponse(Response.Status.OK, "application/json", resJson))
+        return addCors(session, newFixedLengthResponse(Response.Status.OK, "application/json", resJson))
     }
 
-    private fun handleServeLocalManifest(): Response {
-        val manifest = cachedManifestJson
+    private fun handleServeLocalManifest(session: IHTTPSession): Response {
+        // NanoHTTPD mapeia parâmetros de consulta em session.parameters como List<String>
+        val reqId = session.parameters["id"]?.firstOrNull() ?: lastContentId
+        val manifest = if (!reqId.isNullOrBlank()) manifestCache[reqId] else null
+
         return if (manifest != null) {
-            Log.i(tag, "PS4 solicitou e recebeu o manifesto local via Wi-Fi.")
-            addCors(newFixedLengthResponse(Response.Status.OK, "application/json; charset=utf-8", manifest))
+            Log.i(tag, "Manifesto entregue ao PS4 para o ID: $reqId")
+            addCors(session, newFixedLengthResponse(Response.Status.OK, "application/json; charset=utf-8", manifest))
         } else {
-            Log.w(tag, "PS4 solicitou manifesto, mas nenhum estava em cache.")
-            addCors(newFixedLengthResponse(Response.Status.NOT_FOUND, "application/json", """{"error": "Manifesto ausente"}"""))
+            Log.w(tag, "PS4 solicitou manifesto inexistente ou expirado no cache.")
+            addCors(session, newFixedLengthResponse(Response.Status.NOT_FOUND, "application/json", """{"error":"Manifesto ausente"}"""))
         }
     }
 
-    private fun handleProxyStatic(targetUrl: String, mime: String): Response {
+    private fun handleProxyStatic(targetUrl: String, mime: String, session: IHTTPSession): Response {
         val req = Request.Builder().url(targetUrl).build()
-        val resp = proxyClient.newCall(req).execute()
-        val body = resp.body?.string() ?: "Falha ao carregar a interface remota."
-        return addCors(newFixedLengthResponse(Response.Status.OK, mime, body))
+        return proxyClient.newCall(req).execute().use { resp ->
+            val body = resp.body?.string() ?: "Falha ao carregar interface remota."
+            addCors(session, newFixedLengthResponse(Response.Status.OK, mime, body))
+        }
     }
 
     private fun handleProxyForward(session: IHTTPSession): Response {
-        val queryString = if (session.queryParameterString != null) "?${session.queryParameterString}" else ""
+        val queryString = if (!session.queryParameterString.isNullOrBlank()) "?${session.queryParameterString}" else ""
         val targetUrl = "$adminHost${session.uri}$queryString"
         val reqBuilder = Request.Builder().url(targetUrl)
 
@@ -214,32 +235,40 @@ class LocalBridgeServer(
             val map = HashMap<String, String>()
             session.parseBody(map)
             val bodyText = map["postData"] ?: ""
-            reqBuilder.post(bodyText.toRequestBody("application/json".toMediaTypeOrNull()))
+            val contentType = session.headers["content-type"] ?: "application/json"
+            reqBuilder.post(bodyText.toRequestBody(contentType.toMediaTypeOrNull()))
         }
 
-        val resp = proxyClient.newCall(reqBuilder.build()).execute()
-        val bytes = resp.body?.bytes() ?: ByteArray(0)
-        val contentType = resp.header("Content-Type") ?: "application/octet-stream"
+        return proxyClient.newCall(reqBuilder.build()).execute().use { resp ->
+            val bytes = resp.body?.bytes() ?: ByteArray(0)
+            val contentType = resp.header("Content-Type") ?: "application/octet-stream"
 
-        return addCors(
-            newFixedLengthResponse(
-                Response.Status.lookup(resp.code),
-                contentType,
-                ByteArrayInputStream(bytes),
-                bytes.size.toLong()
+            val status = Response.Status.lookup(resp.code) ?: object : Response.IStatus {
+                override fun getRequestStatus(): Int = resp.code
+                override fun getDescription(): String = resp.message
+            }
+
+            addCors(
+                session,
+                newFixedLengthResponse(
+                    status,
+                    contentType,
+                    ByteArrayInputStream(bytes),
+                    bytes.size.toLong()
+                )
             )
-        )
+        }
     }
 
     private fun getLocalWifiAddress(): String? {
         try {
-            val interfaces = NetworkInterface.getNetworkInterfaces()
-            while (interfaces.hasMoreElements()) {
-                val intf = interfaces.nextElement()
+            val interfaces = NetworkInterface.getNetworkInterfaces()?.toList() ?: return null
+            // Prioriza interfaces 'wlan' (Wi-Fi)
+            val sorted = interfaces.sortedByDescending { it.name.startsWith("wlan") }
+
+            for (intf in sorted) {
                 if (intf.isLoopback || !intf.isUp) continue
-                val addrs = intf.inetAddresses
-                while (addrs.hasMoreElements()) {
-                    val addr = addrs.nextElement()
+                for (addr in intf.inetAddresses) {
                     if (!addr.isLoopbackAddress && addr is Inet4Address) {
                         return addr.hostAddress
                     }
@@ -249,10 +278,12 @@ class LocalBridgeServer(
         return null
     }
 
-    private fun addCors(response: Response): Response {
+    private fun addCors(session: IHTTPSession, response: Response): Response {
+        val requestHeaders = session.headers["access-control-request-headers"] ?: "Content-Type, Authorization, Range, X-Requested-With"
         response.addHeader("Access-Control-Allow-Origin", "*")
-        response.addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        response.addHeader("Access-Control-Allow-Headers", "Content-Type, Range")
+        response.addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
+        response.addHeader("Access-Control-Allow-Headers", requestHeaders)
+        response.addHeader("Access-Control-Max-Age", "86400")
         return response
     }
 }
