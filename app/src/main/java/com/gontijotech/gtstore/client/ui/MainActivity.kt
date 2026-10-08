@@ -1,142 +1,65 @@
 package com.gontijotech.gtstore.client.ui
 
-import android.Manifest
-import android.content.Context
+import android.annotation.SuppressLint
 import android.content.Intent
-import android.content.pm.PackageManager
+import android.graphics.Color
 import android.net.Uri
-import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
-import android.widget.Button
-import android.widget.TextView
-import androidx.appcompat.app.AppCompatActivity
-import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
+import android.view.View
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
+import androidx.activity.enableEdgeToEdge
 import com.gontijotech.gtstore.client.service.LocalBridgeService
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
-import java.net.InetAddress
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : ComponentActivity() {
 
-    private lateinit var tvStatus: TextView
-    private lateinit var tvUrl: TextView
-    private lateinit var btnToggle: Button
-    private lateinit var btnOpenStore: Button
+    private lateinit var webView: WebView
+    private val localServerUrl = "http://127.0.0.1:8080"
+    private var isReloading = false
 
-    private var uiUpdateJob: Job? = null
-
-    companion object {
-        private const val PERMISSION_REQUEST_NOTIFICATIONS = 1001
-    }
-
+    @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 1. Verifica e solicita a permissão de notificações em tempo de execução (Android 13+)
-        checkNotificationPermission()
+        // Habilita tela cheia ponta a ponta (Edge-to-Edge)
+        enableEdgeToEdge()
 
-        // 2. Inicia o serviço e o servidor local automaticamente se ainda não estiver ativo
-        if (!LocalBridgeService.isRunning) {
-            startBridgeService()
+        // 1. Inicia o serviço do servidor local em segundo plano
+        startLocalBridgeService()
+
+        // 2. Configura a WebView em tela cheia
+        webView = WebView(this).apply {
+            setBackgroundColor(Color.parseColor("#06080d")) // Fundo escuro idêntico à loja
+            scrollBarStyle = View.SCROLLBARS_INSIDE_OVERLAY
         }
 
-        // 3. Montagem da interface visual programática
-        val layout = android.widget.LinearLayout(this).apply {
-            orientation = android.widget.LinearLayout.VERTICAL
-            setPadding(48, 64, 48, 64)
-            gravity = android.view.Gravity.CENTER_HORIZONTAL
-        }
+        configureWebSettings(webView.settings)
+        setupWebViewClient()
 
-        val title = TextView(this).apply {
-            text = "GTSTORE Ponte Local"
-            textSize = 24f
-            setTypeface(null, android.graphics.Typeface.BOLD)
-            setPadding(0, 0, 0, 32)
-        }
+        setContentView(webView)
 
-        tvStatus = TextView(this).apply {
-            textSize = 16f
-            setPadding(0, 0, 0, 16)
-        }
+        // 3. Carrega a loja local
+        webView.loadUrl(localServerUrl)
 
-        tvUrl = TextView(this).apply {
-            textSize = 14f
-            setPadding(0, 0, 0, 48)
-        }
-
-        btnToggle = Button(this).apply {
-            text = "Alternar Servidor"
-            setOnClickListener { toggleService() }
-        }
-
-        btnOpenStore = Button(this).apply {
-            text = "Abrir Loja no Navegador"
-            setPadding(0, 24, 0, 0)
-            setOnClickListener {
-                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("http://127.0.0.1:8080")))
+        // 4. Suporte nativo ao gesto de voltar
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                if (webView.canGoBack()) {
+                    webView.goBack()
+                } else {
+                    finish()
+                }
             }
-        }
-
-        layout.addView(title)
-        layout.addView(tvStatus)
-        layout.addView(tvUrl)
-        layout.addView(btnToggle)
-        layout.addView(btnOpenStore)
-
-        setContentView(layout)
+        })
     }
 
-    override fun onResume() {
-        super.onResume()
-        updateUi()
-
-        // Mantém a tela sincronizada em tempo real com o estado do servidor em segundo plano
-        uiUpdateJob?.cancel()
-        uiUpdateJob = CoroutineScope(Dispatchers.Main).launch {
-            while (isActive) {
-                updateUi()
-                delay(1000)
-            }
-        }
-    }
-
-    override fun onPause() {
-        super.onPause()
-        uiUpdateJob?.cancel()
-    }
-
-    private fun checkNotificationPermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED
-            ) {
-                ActivityCompat.requestPermissions(
-                    this,
-                    arrayOf(Manifest.permission.POST_NOTIFICATIONS),
-                    PERMISSION_REQUEST_NOTIFICATIONS
-                )
-            }
-        }
-    }
-
-    private fun toggleService() {
-        if (LocalBridgeService.isRunning) {
-            stopService(Intent(this, LocalBridgeService::class.java))
-        } else {
-            startBridgeService()
-        }
-        window.decorView.postDelayed({ updateUi() }, 300)
-    }
-
-    private fun startBridgeService() {
+    private fun startLocalBridgeService() {
         val intent = Intent(this, LocalBridgeService::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(intent)
@@ -145,27 +68,68 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun updateUi() {
-        val running = LocalBridgeService.isRunning
-        tvStatus.text = if (running) "Status: ATIVO (Servidor pronto)" else "Status: PARADO"
-        tvStatus.setTextColor(if (running) 0xFF2ECC71.toInt() else 0xFFFF453A.toInt())
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun configureWebSettings(settings: WebSettings) {
+        settings.apply {
+            javaScriptEnabled = true
+            // Fundamental para o carrinho, IP e pedidos persistirem no app
+            domStorageEnabled = true
+            databaseEnabled = true
 
-        val ip = getWifiIpAddress()
-        tvUrl.text = if (running) "Acesse: http://127.0.0.1:8080 ou http://$ip:8080" else "Servidor desligado"
-        btnToggle.text = if (running) "Parar Servidor" else "Iniciar Servidor"
-        btnOpenStore.isEnabled = running
+            // Layout responsivo
+            useWideViewPort = true
+            loadWithOverviewMode = true
+            displayZoomControls = false
+            builtInZoomControls = false
+
+            // Suporte a chamadas HTTP locais + HTTPS do Firebase
+            mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+            cacheMode = WebSettings.LOAD_DEFAULT
+        }
     }
 
-    private fun getWifiIpAddress(): String {
-        return try {
-            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            val ipInt = wm.connectionInfo.ipAddress
-            if (ipInt == 0) "127.0.0.1"
-            else InetAddress.getByAddress(
-                ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(ipInt).array()
-            ).hostAddress ?: "127.0.0.1"
-        } catch (_: Exception) {
-            "127.0.0.1"
+    private fun setupWebViewClient() {
+        webView.webViewClient = object : WebViewClient() {
+
+            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                val url = request?.url?.toString() ?: return false
+
+                // Intercepta links do WhatsApp e abre no aplicativo nativo
+                if (url.startsWith("whatsapp://") || url.contains("wa.me") || url.contains("api.whatsapp.com")) {
+                    try {
+                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                        startActivity(intent)
+                        return true
+                    } catch (_: Exception) {
+                        return false
+                    }
+                }
+
+                // Mantém a navegação interna dentro do próprio WebView
+                return false
+            }
+
+            override fun onReceivedError(
+                view: WebView?,
+                request: WebResourceRequest?,
+                error: WebResourceError?
+            ) {
+                super.onReceivedError(view, request, error)
+
+                // Se o WebView carregar antes do servidor na 8080 terminar de subir, tenta reconectar após 600ms
+                if (request?.isForMainFrame == true && !isReloading) {
+                    isReloading = true
+                    view?.postDelayed({
+                        isReloading = false
+                        view.loadUrl(localServerUrl)
+                    }, 600)
+                }
+            }
         }
+    }
+
+    override fun onDestroy() {
+        webView.destroy()
+        super.onDestroy()
     }
 }
