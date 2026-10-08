@@ -6,7 +6,10 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
 
-    <!-- Permissões para execução de serviço em segundo plano -->
+    <!-- Impede que a CPU e o rádio Wi-Fi entrem em repouso com tela apagada -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Permissões para execução de serviço em segundo plano (Android 13 e 14+) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -25,7 +28,13 @@
             android:name="com.gontijotech.gtstore.client.service.LocalBridgeService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="specialUse" />
+            android:foregroundServiceType="specialUse">
+
+            <!-- Obrigatório no Android 14+ quando foregroundServiceType é 'specialUse' -->
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Servidor HTTP local e ponte de injeção de dados para console na rede local" />
+        </service>
 
         <!-- Ecrã principal e ponto de entrada no lançador de aplicações -->
         <activity
