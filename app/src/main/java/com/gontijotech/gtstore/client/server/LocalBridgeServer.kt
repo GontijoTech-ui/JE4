@@ -9,6 +9,7 @@ import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.net.Inet4Address
@@ -71,50 +72,88 @@ class LocalBridgeServer(
         val json = JSONObject(map["postData"] ?: "{}")
 
         val ps4Ip = json.getString("ps4Ip")
-        val rawManifestUrl = if (json.has("manifestUrl")) json.getString("manifestUrl") else json.optString("pkgUrl", "")
         val title = json.optString("title", "Jogo PS4")
         val contentId = json.optString("contentId", "CUSA00000")
         val category = json.optString("category", "gd")
         val size = json.optLong("size", 0L)
 
-        // 1. Resolve e busca a cópia atualizada do manifesto no Admin
-        val remoteManifestUrl = when {
-            rawManifestUrl.startsWith("http://") || rawManifestUrl.startsWith("https://") -> rawManifestUrl
-            rawManifestUrl.startsWith("/") -> "$adminHost$rawManifestUrl"
-            else -> "$adminHost/json/$rawManifestUrl.json"
-        }
+        // Obtém o link direto do arquivo .pkg vindo da interface
+        val directPkgUrl = json.optString("packageUrl",
+            json.optString("pkgUrl",
+                json.optString("url",
+                    json.optString("directUrl", "")
+                )
+            )
+        )
 
-        Log.i(tag, "Buscando cópia atualizada do manifesto em: $remoteManifestUrl")
+        val rawManifestUrl = json.optString("manifestUrl", "")
 
-        try {
-            val req = Request.Builder().url(remoteManifestUrl).build()
-            val resp = proxyClient.newCall(req).execute()
+        // 1. Gera o manifesto local em memória ou busca remotamente se for rota legada
+        if (directPkgUrl.isNotEmpty() && (directPkgUrl.startsWith("http://") || directPkgUrl.startsWith("https://"))) {
+            // Gera a estrutura JSON padrão compatível com o BGFT da consola
+            cachedManifestJson = JSONObject().apply {
+                put("originalFileSize", size)
+                put("packageDigest", "")
+                put("numberOfSplitFiles", 1)
+                put("pieces", JSONArray().apply {
+                    put(JSONObject().apply {
+                        put("url", directPkgUrl)
+                        put("fileOffset", 0L)
+                        put("fileSize", size)
+                    })
+                })
+            }.toString()
+            Log.i(tag, "Manifesto gerado em memória RAM com sucesso para o pacote.")
+        } else if (rawManifestUrl.isNotEmpty()) {
+            val remoteManifestUrl = when {
+                rawManifestUrl.startsWith("http://") || rawManifestUrl.startsWith("https://") -> rawManifestUrl
+                rawManifestUrl.startsWith("/") -> "$adminHost$rawManifestUrl"
+                else -> "$adminHost/json/$rawManifestUrl.json"
+            }
 
-            if (resp.isSuccessful) {
-                cachedManifestJson = resp.body?.string()
-                Log.i(tag, "Manifesto obtido e armazenado em cache local com sucesso.")
-            } else {
-                Log.w(tag, "Servidor retornou HTTP ${resp.code} ao buscar manifesto.")
+            Log.i(tag, "Buscando manifesto remoto em: $remoteManifestUrl")
+
+            try {
+                val req = Request.Builder().url(remoteManifestUrl).build()
+                val resp = proxyClient.newCall(req).execute()
+
+                if (resp.isSuccessful) {
+                    cachedManifestJson = resp.body?.string()
+                    Log.i(tag, "Manifesto obtido e armazenado em cache local.")
+                } else {
+                    Log.w(tag, "Servidor retornou HTTP ${resp.code} ao buscar manifesto.")
+                    return addCors(
+                        newFixedLengthResponse(
+                            Response.Status.BAD_REQUEST,
+                            "application/json",
+                            JSONObject().apply {
+                                put("success", false)
+                                put("error", "Não foi possível obter os dados do jogo no servidor (HTTP ${resp.code})")
+                            }.toString()
+                        )
+                    )
+                }
+            } catch (e: Exception) {
+                Log.e(tag, "Falha ao conectar com o Admin: ${e.message}")
                 return addCors(
                     newFixedLengthResponse(
-                        Response.Status.BAD_REQUEST,
+                        Response.Status.INTERNAL_ERROR,
                         "application/json",
                         JSONObject().apply {
                             put("success", false)
-                            put("error", "Não foi possível obter os dados do jogo no servidor (HTTP ${resp.code})")
+                            put("error", "Falha de rede ao sincronizar com o Admin: ${e.message}")
                         }.toString()
                     )
                 )
             }
-        } catch (e: Exception) {
-            Log.e(tag, "Falha ao conectar com o servidor Admin para obter o JSON: ${e.message}")
+        } else {
             return addCors(
                 newFixedLengthResponse(
-                    Response.Status.INTERNAL_ERROR,
+                    Response.Status.BAD_REQUEST,
                     "application/json",
                     JSONObject().apply {
                         put("success", false)
-                        put("error", "Falha de rede ao sincronizar com o Admin: ${e.message}")
+                        put("error", "Nenhum link direto (packageUrl) configurado para este jogo.")
                     }.toString()
                 )
             )
@@ -125,7 +164,7 @@ class LocalBridgeServer(
         val localManifestUrl = "http://$localIp:$port/local-manifest.json"
         Log.i(tag, "URL local fornecida ao PS4: $localManifestUrl")
 
-        // 3. Disparo integral via payload.bin com a URL local HTTP (sem SSL, na rede local)
+        // 3. Disparo integral via payload.bin com a URL local HTTP
         val result = runBlocking {
             payloader.injectDpiPayload(
                 ps4Ip = ps4Ip,
