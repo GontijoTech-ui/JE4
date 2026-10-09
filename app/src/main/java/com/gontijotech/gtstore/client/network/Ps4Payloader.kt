@@ -1,4 +1,4 @@
-Package com.gontijotech.gtstore.client.network
+package com.gontijotech.gtstore.client.network
 
 import android.content.Context
 import android.util.Log
@@ -10,8 +10,6 @@ import java.net.Socket
 class Ps4Payloader(private val context: Context) {
 
     private val tag = "Ps4Payloader"
-
-    // [Mantenha o seu método injectDpiPayload original da porta 9090 com metadados e ícone]
 
     /**
      * Testa se uma porta TCP está ativa e a escutar na PS4.
@@ -41,7 +39,7 @@ class Ps4Payloader(private val context: Context) {
                 Socket().use { socket ->
                     socket.connect(InetSocketAddress(ps4Ip, port), 2500)
 
-                    // Corrigido para apontar para "payload.bin" nos assets
+                    // Lê o payload binário correto a partir dos assets
                     val payloadStream: InputStream = context.assets.open("payload.bin")
                     val out: OutputStream = socket.getOutputStream()
 
