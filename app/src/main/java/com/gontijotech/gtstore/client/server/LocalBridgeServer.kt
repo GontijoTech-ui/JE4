@@ -29,21 +29,24 @@ class LocalBridgeServer(
 
     private val proxyClient =
         OkHttpClient.Builder()
-            .connectTimeout(12, TimeUnit.SECONDS)
-            .readTimeout(35, TimeUnit.SECONDS)
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(0, TimeUnit.MILLISECONDS) // Sem timeout de leitura para suportar streaming longo
             .build()
 
-    // Cliente com timeout curto para checar a porta 12800 sem travar a interface
     private val rpiClient =
         OkHttpClient.Builder()
-            .connectTimeout(3, TimeUnit.SECONDS)
-            .readTimeout(8, TimeUnit.SECONDS)
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(10, TimeUnit.SECONDS)
             .build()
 
     private val payloader =
         Ps4Payloader(context)
 
     private val manifestCache =
+        ConcurrentHashMap<String, String>()
+
+    // Cache de URLs remotas para alimentar o proxy de streaming
+    private val remoteUrlCache =
         ConcurrentHashMap<String, String>()
 
     @Volatile
@@ -72,8 +75,6 @@ class LocalBridgeServer(
         val uri = session.uri
         val method = session.method
 
-        fileLog("Requisição: $method $uri")
-
         if (method == Method.OPTIONS) {
             return addCors(
                 session,
@@ -83,10 +84,17 @@ class LocalBridgeServer(
 
         return try {
             when {
+                // Injeção de pacotes
                 method == Method.POST && uri == "/api/local/inject" -> {
                     handleLocalInject(session)
                 }
 
+                // Streaming Proxy para a porta 12800 (RPI)
+                (method == Method.GET || method == Method.HEAD) && uri.startsWith("/stream/") -> {
+                    handleStreamProxy(session)
+                }
+
+                // Manifesto local para o método BGFT (Porta 9090)
                 method == Method.GET && (
                     uri.startsWith("/json/") ||
                     uri.startsWith("/manifest/") ||
@@ -119,35 +127,46 @@ class LocalBridgeServer(
 
     /*
      * ================================================================
-     * INJEÇÃO (PORTA 12800 COM FALLBACK PARA 9090)
+     * CRITÉRIO DE DECISÃO: URL LIMPA (9090) vs COMPLEXA (12800 + PROXY)
      * ================================================================
      */
+    private fun isBgftCompatible(url: String): Boolean {
+        // Se contiver tokens de autenticação ou parâmetros de expiração
+        if (url.contains("?") && (url.contains("token=", ignoreCase = true) || url.contains("expires=", ignoreCase = true))) {
+            return false
+        }
+        // Se a URL for muito longa para o buffer JSON da Sony
+        if (url.length > 220) {
+            return false
+        }
+        // Se contiver caracteres especiais que quebram a rota de CDN nativa do console
+        if (url.contains("(") || url.contains(")") || url.contains("%2B", ignoreCase = true)) {
+            return false
+        }
+        return true
+    }
+
     private fun handleLocalInject(session: IHTTPSession): Response {
         val map = HashMap<String, String>()
         session.parseBody(map)
 
         val postData = map["postData"] ?: "{}"
         fileLog("========================================")
-        fileLog("INÍCIO DA INJEÇÃO")
+        fileLog("SOLICITAÇÃO DE INJEÇÃO RECEBIDA:")
         fileLog(postData)
 
         val json = JSONObject(postData)
 
         val ps4Ip = json.optString("ps4Ip").trim()
         if (ps4Ip.isEmpty()) {
-            fileWarn("IP do PS4 não informado.")
             return jsonError(session, Response.Status.BAD_REQUEST, "O campo 'ps4Ip' é obrigatório.")
         }
 
-        val title = json.optString("title", "Jogo PS4").trim()
-        val rawCategory = json.optString("category", "gd").trim()
-        val bgftCategory = if (rawCategory.startsWith("PS4", ignoreCase = true)) {
-            rawCategory.uppercase()
-        } else {
-            "PS4${rawCategory.uppercase()}"
+        val localIp = getLocalWifiAddress()
+        if (localIp == null) {
+            return jsonError(session, Response.Status.BAD_REQUEST, "O aparelho não está conectado ao Wi-Fi local.")
         }
 
-        // Sanitiza a URL garantindo scheme minúsculo
         var directPkgUrl = (
             json.optString("packageUrl")
                 .ifBlank { json.optString("pkgUrl") }
@@ -162,8 +181,15 @@ class LocalBridgeServer(
         }
 
         if (directPkgUrl.isEmpty()) {
-            fileWarn("Nenhum link direto configurado.")
-            return jsonError(session, Response.Status.BAD_REQUEST, "Nenhum link direto configurado para o pacote.")
+            return jsonError(session, Response.Status.BAD_REQUEST, "URL direta do pacote não encontrada.")
+        }
+
+        val title = json.optString("title", "Jogo PS4").trim()
+        val rawCategory = json.optString("category", "gd").trim()
+        val bgftCategory = if (rawCategory.startsWith("PS4", ignoreCase = true)) {
+            rawCategory.uppercase()
+        } else {
+            "PS4${rawCategory.uppercase()}"
         }
 
         val contentId = (
@@ -209,28 +235,21 @@ class LocalBridgeServer(
             null
         }
 
-        fileLog("Tentando envio via GoldHEN RPI (Porta 12800)...")
-
-        // 1. TENTA PRIMEIRO PELA PORTA 12800 (RPI NATIVO DO GOLDHEN)
-        val rpiResult = sendViaRpiPort12800(ps4Ip, directPkgUrl)
+        // Guarda a URL real para uso pelo proxy de streaming
+        remoteUrlCache[normalizedCatalogIndex] = directPkgUrl
 
         val finalSuccess: Boolean
-        var usedMethod = "RPI_12800"
+        val usedMethod: String
         var errorMessage: String? = null
 
-        if (rpiResult.isSuccess) {
-            finalSuccess = true
-            fileLog("✓ Sucesso imediato via GoldHEN RPI (Porta 12800)!")
-        } else {
-            fileWarn("Porta 12800 indisponível (${rpiResult.exceptionOrNull()?.message}). Recorrendo ao BGFT/DPI (Porta 9090)...")
+        // Decisão de rota baseada na complexidade da URL
+        if (isBgftCompatible(directPkgUrl)) {
+            /*
+             * CAMINHO 1: URL LIMPA (ex: GTA V) -> BGFT NATIVO (Porta 9090)
+             */
             usedMethod = "BGFT_9090"
+            fileLog("URL limpa identificada. Encaminhando via BGFT/DPI (Porta 9090)...")
 
-            val localIp = getLocalWifiAddress()
-            if (localIp == null) {
-                return jsonError(session, Response.Status.BAD_REQUEST, "O aparelho não está conectado ao Wi-Fi local.")
-            }
-
-            // Monta o manifesto BGFT de contingência
             val manifestJsonString = JSONObject().apply {
                 put("originalFileSize", fileSize)
                 put("packageDigest", packageDigest)
@@ -270,7 +289,22 @@ class LocalBridgeServer(
 
             finalSuccess = dpiResult.isSuccess
             if (!finalSuccess) {
-                errorMessage = dpiResult.exceptionOrNull()?.message ?: "Falha em ambos os métodos (12800 e 9090)."
+                errorMessage = dpiResult.exceptionOrNull()?.message ?: "Falha na injeção via porta 9090."
+            }
+        } else {
+            /*
+             * CAMINHO 2: URL COMPLEXA (Tokens, Alone in the Dark) -> RPI (Porta 12800) + Streaming Proxy Local
+             */
+            usedMethod = "RPI_12800_PROXY"
+            fileLog("URL complexa/tokenizada identificada. Encaminhando via RPI (Porta 12800) com Proxy Local...")
+
+            val localStreamUrl = "http://$localIp:$port/stream/$normalizedCatalogIndex.pkg"
+            fileLog("Link local gerado para o console: $localStreamUrl")
+
+            val rpiResult = sendViaRpiPort12800(ps4Ip, localStreamUrl)
+            finalSuccess = rpiResult.isSuccess
+            if (!finalSuccess) {
+                errorMessage = rpiResult.exceptionOrNull()?.message ?: "Falha no envio para a porta 12800."
             }
         }
 
@@ -284,7 +318,7 @@ class LocalBridgeServer(
             }
         }.toString()
 
-        fileLog("Fim da injeção. Resultado: $responseJson")
+        fileLog("Fim do processo de injeção. Resultado: $responseJson")
         fileLog("========================================")
 
         return addCors(
@@ -293,44 +327,94 @@ class LocalBridgeServer(
         )
     }
 
-    /**
-     * Envia o link diretamente para a porta 12800 do GoldHEN.
-     * Não valida digest, aceita URLs longas com tokens e não exige app aberto no console.
+    /*
+     * ================================================================
+     * STREAMING PROXY (CANALIZAÇÃO EM TEMPO REAL COM RANGE)
+     * ================================================================
      */
-    private fun sendViaRpiPort12800(ps4Ip: String, directPkgUrl: String): Result<Unit> {
+    private fun handleStreamProxy(session: IHTTPSession): Response {
+        val uri = session.uri
+        val catalogIndex = uri.removePrefix("/stream/").removeSuffix(".pkg").trim()
+
+        val targetUrl = remoteUrlCache[catalogIndex]
+        if (targetUrl.isNullOrBlank()) {
+            fileWarn("URL externa de streaming não encontrada para o índice $catalogIndex")
+            return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Ficheiro não configurado.")
+        }
+
+        val rangeHeader = session.headers["range"]
+        fileLog("Requisição de Stream da PS4 [$catalogIndex] | Range: $rangeHeader")
+
+        val reqBuilder = Request.Builder()
+            .url(targetUrl)
+            .addHeader("User-Agent", "Mozilla/5.0 (PlayStation 4 11.50) AppleWebKit/605.1.15")
+
+        if (!rangeHeader.isNullOrBlank()) {
+            reqBuilder.addHeader("Range", rangeHeader)
+        }
+
+        val remoteResponse = proxyClient.newCall(reqBuilder.build()).execute()
+        val responseBody = remoteResponse.body ?: return newFixedLengthResponse(
+            Response.Status.INTERNAL_ERROR, "text/plain", "Falha de resposta no servidor remoto."
+        )
+
+        val contentLength = responseBody.contentLength()
+        val contentType = remoteResponse.header("Content-Type") ?: "application/octet-stream"
+        val contentRange = remoteResponse.header("Content-Range")
+
+        val status = if (remoteResponse.code == 206) Response.Status.PARTIAL_CONTENT else Response.Status.OK
+
+        val response = newFixedLengthResponse(
+            status,
+            contentType,
+            responseBody.byteStream(),
+            contentLength
+        )
+
+        response.addHeader("Accept-Ranges", "bytes")
+        if (!contentRange.isNullOrBlank()) {
+            response.addHeader("Content-Range", contentRange)
+        }
+
+        return addCors(session, response)
+    }
+
+    private fun sendViaRpiPort12800(ps4Ip: String, localStreamUrl: String): Result<Unit> {
         return try {
             val rpiUrl = "http://$ps4Ip:12800/api/install"
 
-            val payload = JSONObject().apply {
+            val jsonPayload = JSONObject().apply {
                 put("type", "direct")
-                put("packages", JSONArray().apply { put(directPkgUrl) })
+                put("packages", JSONArray().apply {
+                    put(localStreamUrl)
+                })
             }.toString()
+
+            fileLog("Disparando comando de instalação para $rpiUrl com payload:")
+            fileLog(jsonPayload)
 
             val request = Request.Builder()
                 .url(rpiUrl)
-                .post(payload.toRequestBody("application/json".toMediaTypeOrNull()))
+                .addHeader("Content-Type", "application/json; charset=utf-8")
+                .post(jsonPayload.toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull()))
                 .build()
 
             rpiClient.newCall(request).execute().use { response ->
                 val body = response.body?.string().orEmpty()
-                fileLog("Resposta da porta 12800 [HTTP ${response.code}]: $body")
+                fileLog("Resposta do RPI (12800) [HTTP ${response.code}]: $body")
 
-                if (response.isSuccessful && (body.contains("success", ignoreCase = true) || body.contains("task_id", ignoreCase = true))) {
+                if (response.isSuccessful && !body.contains("fail", ignoreCase = true)) {
                     Result.success(Unit)
                 } else {
-                    Result.failure(Exception("HTTP ${response.code}: $body"))
+                    Result.failure(Exception("Porta 12800 recusou: HTTP ${response.code} - $body"))
                 }
             }
         } catch (e: Exception) {
+            fileError("Exceção ao comunicar com a porta 12800: ${e.message}", e)
             Result.failure(e)
         }
     }
 
-    /*
-     * ================================================================
-     * SERVIR MANIFESTO (BGFT)
-     * ================================================================
-     */
     private fun handleServeLocalManifest(session: IHTTPSession): Response {
         val uri = session.uri
         val rawRequest = when {
@@ -432,7 +516,7 @@ class LocalBridgeServer(
                 }
             }
         } catch (e: Exception) {
-            fileError("Erro ao detectar IP local: ${e.message}", e)
+            fileError("Erro ao detetar IP local: ${e.message}", e)
         }
         return null
     }
@@ -442,7 +526,7 @@ class LocalBridgeServer(
             ?: "Content-Type, Authorization, Range, X-Requested-With"
 
         response.addHeader("Access-Control-Allow-Origin", "*")
-        response.addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
+        response.addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE, HEAD")
         response.addHeader("Access-Control-Allow-Headers", requestedHeaders)
         response.addHeader("Access-Control-Max-Age", "86400")
         return response
