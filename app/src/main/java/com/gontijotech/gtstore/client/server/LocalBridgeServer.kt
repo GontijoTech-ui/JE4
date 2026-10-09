@@ -380,6 +380,16 @@ class LocalBridgeServer(
     }
 
     private fun sendViaRpiPort12800(ps4Ip: String, localStreamUrl: String): Result<Unit> {
+        // 1. Verifica se a porta 12800 está aberta; caso contrário, acorda-a injetando o payload no BinLoader (9090/9020)
+        if (!payloader.isPortOpen(ps4Ip, 12800)) {
+            fileWarn("Porta 12800 fechada na PS4. Acordando serviço via payload no BinLoader...")
+            val activation = payloader.startRpiServerDaemon(ps4Ip)
+            if (!activation.isSuccess) {
+                return Result.failure(Exception("A porta 12800 está fechada e o console não respondeu ao BinLoader (9090/9020)."))
+            }
+        }
+
+        // 2. Dispara o comando de instalação para a porta 12800
         return try {
             val rpiUrl = "http://$ps4Ip:12800/api/install"
 
