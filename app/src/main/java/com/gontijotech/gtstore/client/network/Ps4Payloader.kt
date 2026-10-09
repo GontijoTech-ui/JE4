@@ -1,4 +1,4 @@
-package com.gontijotech.gtstore.client.network
+Package com.gontijotech.gtstore.client.network
 
 import android.content.Context
 import android.util.Log
@@ -41,7 +41,8 @@ class Ps4Payloader(private val context: Context) {
                 Socket().use { socket ->
                     socket.connect(InetSocketAddress(ps4Ip, port), 2500)
 
-                    val payloadStream: InputStream = context.assets.open("payload")
+                    // Corrigido para apontar para "payload.bin" nos assets
+                    val payloadStream: InputStream = context.assets.open("payload.bin")
                     val out: OutputStream = socket.getOutputStream()
 
                     val buffer = ByteArray(4096)
