@@ -274,23 +274,24 @@ class LocalBridgeServer(
 
             val localManifestUrl = "http://$localIp:$port/json/$normalizedCatalogIndex.json"
 
-            val dpiResult = runBlocking {
-                payloader.injectDpiPayload(
-                    ps4Ip = ps4Ip,
-                    localIp = localIp,
-                    manifestUrl = localManifestUrl,
-                    itemTitle = title,
-                    contentId = contentId.ifBlank { "EP0000-CUSA00000_00-0000000000000000" },
-                    category = bgftCategory,
-                    fileSize = if (fileSize > 0) fileSize else 1024L,
-                    iconBytes = iconBytes
-                )
+            val successFlag = runBlocking {
+                try {
+                    payloader.injectPayload(
+                        ps4Ip,
+                        localManifestUrl,
+                        title,
+                        contentId.ifBlank { "EP0000-CUSA00000_00-0000000000000000" },
+                        bgftCategory,
+                        if (fileSize > 0) fileSize else 1024L,
+                        iconBytes
+                    )
+                    true
+                } catch (e: Exception) {
+                    errorMessage = e.message
+                    false
+                }
             }
-
-            finalSuccess = dpiResult.isSuccess
-            if (!finalSuccess) {
-                errorMessage = dpiResult.exceptionOrNull()?.message ?: "Falha na injeção via porta 9090."
-            }
+            finalSuccess = successFlag
         } else {
             /*
              * CAMINHO 2: URL COMPLEXA (Tokens, Alone in the Dark) -> RPI (Porta 12800) + Streaming Proxy Local
