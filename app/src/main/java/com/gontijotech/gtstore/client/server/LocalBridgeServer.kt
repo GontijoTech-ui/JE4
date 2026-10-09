@@ -1,6 +1,7 @@
 package com.gontijotech.gtstore.client.server
 
 import android.content.Context
+import android.util.Base64
 import android.util.Log
 import com.gontijotech.gtstore.client.GTStoreFileLogger
 import com.gontijotech.gtstore.client.network.Ps4Payloader
@@ -40,21 +41,14 @@ class LocalBridgeServer(
             .build()
 
     /*
-     * Mecanismo antigo de payload/callback/DPI.
-     *
-     * Não alterar nesta etapa.
+     * Mecanismo de payload/callback/DPI.
      */
     private val payloader =
         Ps4Payloader(context)
 
     /*
-     * Cache dos manifestos locais.
-     *
-     * Chave:
-     * catalogIndex
-     *
-     * Exemplo:
-     * "1" -> manifesto do catalogIndex 1
+     * Cache dos manifestos locais em memória.
+     * Chave: catalogIndex normalizado ("1", "2", ...)
      */
     private val manifestCache =
         ConcurrentHashMap<String, String>()
@@ -110,7 +104,7 @@ class LocalBridgeServer(
 
                 /*
                  * =====================================================
-                 * INJEÇÃO
+                 * INJEÇÃO LOCAL
                  * =====================================================
                  */
                 method == Method.POST &&
@@ -121,28 +115,13 @@ class LocalBridgeServer(
 
                 /*
                  * =====================================================
-                 * MANIFESTO
-                 *
-                 * Compatibilidade com o mecanismo antigo:
-                 *
-                 * /json/1.json
-                 * /json/2.json
-                 * /json/3.json
+                 * MANIFESTO DO PS4 (BGFT)
+                 * /json/1.json, /manifest/1.json, etc.
                  * =====================================================
                  */
                 method == Method.GET &&
-                    uri.startsWith("/json/") -> {
-
-                    handleServeLocalManifest(session)
-                }
-
-                /*
-                 * Compatibilidade adicional.
-                 *
-                 * Não participa do fluxo principal.
-                 */
-                method == Method.GET &&
                     (
+                        uri.startsWith("/json/") ||
                         uri.startsWith("/manifest/") ||
                         uri == "/local-manifest.json"
                     ) -> {
@@ -167,7 +146,7 @@ class LocalBridgeServer(
 
                 /*
                  * =====================================================
-                 * DEMAIS REQUISIÇÕES DA INTERFACE
+                 * DEMAIS REQUISIÇÕES (PROXY REVERSO DA LOJA)
                  * =====================================================
                  */
                 else -> {
@@ -206,66 +185,27 @@ class LocalBridgeServer(
      * ================================================================
      * INJEÇÃO LOCAL
      * ================================================================
-     *
-     * IMPORTANTE:
-     *
-     * O Android NÃO inspeciona mais o PKG.
-     *
-     * Os metadados abaixo já devem vir do Firebase/catalogo:
-     *
-     * ps4Ip
-     * packageUrl
-     * manifestUrl
-     * title
-     * contentId
-     * category
-     * size
-     * digest
-     * catalogIndex
-     *
-     * O Android somente:
-     *
-     * 1. recebe os dados
-     * 2. cria o manifesto
-     * 3. disponibiliza o manifesto local
-     * 4. injeta o payload
-     * 5. recebe callback
-     * 6. envia DPI
-     *
-     * O PS4 baixa o PKG diretamente da URL externa.
      */
     private fun handleLocalInject(
         session: IHTTPSession
     ): Response {
 
         val map = HashMap<String, String>()
-
         session.parseBody(map)
 
         val postData = map["postData"] ?: "{}"
 
         fileLog("========================================")
-        fileLog("INÍCIO DA INJEÇÃO")
+        fileLog("INÍCIO DA INJEÇÃO LOCAL")
         fileLog("JSON recebido da interface:")
         fileLog(postData)
 
         val json = JSONObject(postData)
 
-        /*
-         * ============================================================
-         * IP DO PS4
-         * ============================================================
-         */
-        val ps4Ip = json
-            .optString("ps4Ip")
-            .trim()
-
+        // 1. IP DO PS4
+        val ps4Ip = json.optString("ps4Ip").trim()
         if (ps4Ip.isEmpty()) {
-
-            fileWarn(
-                "IP do PS4 não informado."
-            )
-
+            fileWarn("IP do PS4 não informado.")
             return jsonError(
                 session,
                 Response.Status.BAD_REQUEST,
@@ -273,85 +213,40 @@ class LocalBridgeServer(
             )
         }
 
-        /*
-         * ============================================================
-         * DADOS DO PACOTE
-         * ============================================================
-         */
-        val title = json
-            .optString("title", "Jogo PS4")
-            .trim()
+        // 2. DADOS DO PACOTE
+        val title = json.optString("title", "Jogo PS4").trim()
+        val rawCategory = json.optString("category", "gd").trim()
+        val bgftCategory = if (rawCategory.startsWith("PS4", ignoreCase = true)) {
+            rawCategory.uppercase()
+        } else {
+            "PS4${rawCategory.uppercase()}"
+        }
 
-        val rawCategory = json
-            .optString("category", "gd")
-            .trim()
-
-        val bgftCategory =
-            if (rawCategory.startsWith("PS4", ignoreCase = true)) {
-                rawCategory.uppercase()
-            } else {
-                "PS4${rawCategory.uppercase()}"
-            }
-
-        /*
-         * URL DIRETA DO PKG
-         *
-         * Esta URL vem do Firebase.
-         *
-         * Exemplo:
-         *
-         * https://stor2.mocha.my/.../arquivo.pkg
-         *
-         * Esta URL será colocada DIRETAMENTE no manifesto.
-         */
+        // 3. URL DIRETA DO PKG
         val directPkgUrl = (
             json.optString("packageUrl")
-                .ifBlank {
-                    json.optString("pkgUrl")
-                }
-                .ifBlank {
-                    json.optString("url")
-                }
-                .ifBlank {
-                    json.optString("directUrl")
-                }
+                .ifBlank { json.optString("pkgUrl") }
+                .ifBlank { json.optString("url") }
+                .ifBlank { json.optString("directUrl") }
         ).trim()
 
         if (directPkgUrl.isEmpty()) {
-
-            fileWarn(
-                "Nenhum link direto configurado."
-            )
-
+            fileWarn("Nenhum link direto configurado.")
             return jsonError(
                 session,
                 Response.Status.BAD_REQUEST,
-                "Nenhum link direto configurado."
+                "Nenhum link direto configurado para o pacote."
             )
         }
 
-        /*
-         * ============================================================
-         * CONTENT-ID
-         *
-         * Não tentar descobrir no PKG.
-         * Não criar Content-ID fictício.
-         * O Admin/Firebase já deve fornecer o valor correto.
-         * ============================================================
-         */
+        // 4. CONTENT-ID
         val contentId = (
             json.optString("contentId")
-                .ifBlank {
-                    json.optString("content_id")
-                }
-        ).trim()
+                .ifBlank { json.optString("content_id") }
+        ).trim().uppercase()
 
         if (contentId.isEmpty()) {
-
-            fileWarn(
-                "Content-ID não informado pelo catálogo/Firebase."
-            )
-
+            fileWarn("Content-ID não informado pelo catálogo.")
             return jsonError(
                 session,
                 Response.Status.BAD_REQUEST,
@@ -359,61 +254,23 @@ class LocalBridgeServer(
             )
         }
 
-        /*
-         * ============================================================
-         * CATALOG INDEX
-         *
-         * Este é o identificador utilizado pelo manifesto antigo:
-         *
-         * /json/{catalogIndex}.json
-         * ============================================================
-         */
-        var catalogIndex =
-            json.optString("catalogIndex").trim()
+        // 5. CATALOG INDEX NORMALIZADO
+        val rawCatalogIndex = (
+            json.optString("catalogIndex")
+                .ifBlank { json.optString("id") }
+                .ifBlank { json.optString("index") }
+        ).trim()
 
-        if (catalogIndex.isEmpty()) {
-            catalogIndex =
-                json.optString("index").trim()
-        }
+        val normalizedCatalogIndex = rawCatalogIndex
+            .filter { it.isDigit() }
+            .toLongOrNull()
+            ?.toString()
+            ?: rawCatalogIndex.ifBlank { "1" }
 
-        if (catalogIndex.isEmpty()) {
-
-            fileWarn(
-                "catalogIndex não informado."
-            )
-
-            return jsonError(
-                session,
-                Response.Status.BAD_REQUEST,
-                "catalogIndex não informado."
-            )
-        }
-
-        /*
-         * Se vier algo como 000001, normalizamos para 1.
-         *
-         * Isso mantém compatibilidade com o formato antigo:
-         *
-         * /json/1.json
-         */
-        val normalizedCatalogIndex =
-            catalogIndex.toLongOrNull()?.toString()
-                ?: catalogIndex
-
-        /*
-         * ============================================================
-         * TAMANHO
-         * ============================================================
-         */
-        val fileSize =
-            json.optLong("size", 0L)
-
+        // 6. TAMANHO EM BYTES
+        val fileSize = json.optLong("size", 0L)
         if (fileSize <= 0L) {
-
-            fileWarn(
-                "Tamanho inválido recebido: $fileSize"
-            )
-
+            fileWarn("Tamanho inválido recebido: $fileSize")
             return jsonError(
                 session,
                 Response.Status.BAD_REQUEST,
@@ -421,57 +278,38 @@ class LocalBridgeServer(
             )
         }
 
-        /*
-         * ============================================================
-         * DIGEST
-         *
-         * O Admin já reconheceu o PKG.
-         *
-         * Se houver digest no Firebase, usamos.
-         * Caso não exista, mantemos a representação de zeros usada
-         * anteriormente pelo manifesto.
-         *
-         * Não calculamos digest do PKG no Client.
-         * ============================================================
-         */
-        val firebaseDigest =
-            json.optString("digest").trim()
+        // 7. DIGEST (64 HEXADECIMAIS)
+        val rawDigest = json.optString("digest").trim()
+        val packageDigest = if (rawDigest.length == 64 && rawDigest.all { it.isLetterOrDigit() }) {
+            rawDigest.uppercase()
+        } else {
+            "0".repeat(64)
+        }
 
-        val packageDigest =
-            if (firebaseDigest.isNotEmpty()) {
-                firebaseDigest
+        // 8. DECODIFICAÇÃO DA CAPA (BASE64 -> BYTEARRAY)
+        val iconBytes: ByteArray? = try {
+            val iconStr = (
+                json.optString("iconUrl")
+                    .ifBlank { json.optString("icon") }
+            ).trim()
+
+            if (iconStr.contains("base64,")) {
+                val cleanBase64 = iconStr.substringAfter("base64,")
+                Base64.decode(cleanBase64, Base64.DEFAULT)
+            } else if (iconStr.startsWith("iVBORw0KGgo") || iconStr.startsWith("/9j/")) {
+                Base64.decode(iconStr, Base64.DEFAULT)
             } else {
-                "0".repeat(64)
+                null
             }
+        } catch (e: Exception) {
+            fileWarn("Falha ao decodificar ícone em Base64: ${e.message}")
+            null
+        }
 
-        /*
-         * ============================================================
-         * LOG DOS DADOS
-         * ============================================================
-         */
-        fileLog("PS4: $ps4Ip")
-        fileLog("Título: $title")
-        fileLog("Categoria recebida: $rawCategory")
-        fileLog("Categoria BGFT: $bgftCategory")
-        fileLog("Catalog Index: $normalizedCatalogIndex")
-        fileLog("Content-ID: $contentId")
-        fileLog("Tamanho: $fileSize bytes")
-        fileLog("Digest: $packageDigest")
-        fileLog("PKG DIRETO: $directPkgUrl")
-
-        /*
-         * ============================================================
-         * IP LOCAL DO ANDROID
-         * ============================================================
-         */
+        // 9. IP WI-FI LOCAL DO ANDROID
         val localIp = getLocalWifiAddress()
-
         if (localIp == null) {
-
-            fileError(
-                "Não foi possível encontrar o IP Wi-Fi do Android."
-            )
-
+            fileError("Não foi possível encontrar o IP Wi-Fi local do Android.")
             return jsonError(
                 session,
                 Response.Status.BAD_REQUEST,
@@ -479,145 +317,47 @@ class LocalBridgeServer(
             )
         }
 
-        fileLog(
-            "IP Wi-Fi do Android: $localIp"
-        )
+        fileLog("PS4        : $ps4Ip")
+        fileLog("Android    : $localIp")
+        fileLog("Título     : $title")
+        fileLog("Índice     : $normalizedCatalogIndex")
+        fileLog("Content-ID : $contentId")
+        fileLog("Categoria  : $bgftCategory")
+        fileLog("Tamanho    : $fileSize bytes")
+        fileLog("Digest     : $packageDigest")
+        fileLog("Capa bytes : ${iconBytes?.size ?: 0} bytes")
+        fileLog("PKG Direto : $directPkgUrl")
 
-        /*
-         * ============================================================
-         * MANIFESTO
-         * ============================================================
-         *
-         * ATENÇÃO:
-         *
-         * A URL abaixo é a URL EXTERNA do PKG.
-         *
-         * Não existe:
-         *
-         * /download-pkg/
-         *
-         * Portanto o Android não participa do download.
-         */
-        val manifestJsonString =
-            JSONObject().apply {
+        // 10. GERAÇÃO DO MANIFESTO RIGOROSO (BGFT)
+        val manifestJsonString = JSONObject().apply {
+            put("originalFileSize", fileSize)
+            put("packageDigest", packageDigest)
+            put("numberOfSplitFiles", 1)
+            put(
+                "pieces",
+                JSONArray().apply {
+                    put(
+                        JSONObject().apply {
+                            put("url", directPkgUrl)
+                            put("fileOffset", 0L)
+                            put("fileSize", fileSize)
+                            put("hashValue", "0000000000000000000000000000000000000000")
+                        }
+                    )
+                }
+            )
+        }.toString()
 
-                put(
-                    "originalFileSize",
-                    fileSize
-                )
+        // 11. ARMAZENA NO CACHE EM MEMÓRIA
+        manifestCache[normalizedCatalogIndex] = manifestJsonString
+        lastCatalogIndex = normalizedCatalogIndex
 
-                put(
-                    "packageDigest",
-                    packageDigest
-                )
+        val localManifestUrl = "http://$localIp:$port/json/$normalizedCatalogIndex.json"
+        fileLog("Manifesto criado e disponível em: $localManifestUrl")
 
-                put(
-                    "numberOfSplitFiles",
-                    1
-                )
-
-                put(
-                    "pieces",
-                    JSONArray().apply {
-
-                        put(
-                            JSONObject().apply {
-
-                                /*
-                                 * URL DIRETA DO PKG
-                                 */
-                                put(
-                                    "url",
-                                    directPkgUrl
-                                )
-
-                                put(
-                                    "fileOffset",
-                                    0L
-                                )
-
-                                put(
-                                    "fileSize",
-                                    fileSize
-                                )
-
-                                /*
-                                 * Mantido exatamente no formato
-                                 * utilizado pelo fluxo anterior.
-                                 */
-                                put(
-                                    "hashValue",
-                                    "0000000000000000000000000000000000000000"
-                                )
-                            }
-                        )
-                    }
-                )
-            }.toString()
-
-        fileLog("Manifesto criado:")
-        fileLog(manifestJsonString)
-
-        /*
-         * ============================================================
-         * CACHE DO MANIFESTO
-         * ============================================================
-         */
-        manifestCache[
-            normalizedCatalogIndex
-        ] = manifestJsonString
-
-        lastCatalogIndex =
-            normalizedCatalogIndex
-
-        fileLog(
-            "Manifesto armazenado para catalogIndex: " +
-                normalizedCatalogIndex
-        )
-
-        /*
-         * ============================================================
-         * URL LOCAL DO MANIFESTO
-         * ============================================================
-         *
-         * O PS4 acessará:
-         *
-         * http://IP_ANDROID:8080/json/1.json
-         *
-         * O Android entrega apenas o JSON.
-         *
-         * O PKG continua externo.
-         */
-        val localManifestUrl =
-            "http://$localIp:$port/json/$normalizedCatalogIndex.json"
-
-        fileLog(
-            "URL do manifesto local: $localManifestUrl"
-        )
-
-        /*
-         * ============================================================
-         * PAYLOADER
-         * ============================================================
-         */
-        fileLog("========================================")
-        fileLog("DISPARANDO PAYLOADER")
-        fileLog("PS4: $ps4Ip")
-        fileLog("Android: $localIp")
-        fileLog("Título: $title")
-        fileLog("Catalog Index: $normalizedCatalogIndex")
-        fileLog("Content-ID: $contentId")
-        fileLog("Categoria: $bgftCategory")
-        fileLog("Tamanho: $fileSize")
-        fileLog("Manifesto: $localManifestUrl")
-        fileLog("PKG será baixado DIRETAMENTE pelo PS4.")
-        fileLog("========================================")
-
-        /*
-         * Mantemos o mecanismo de injeção existente.
-         */
+        // 12. EXECUTA A INJEÇÃO NO CONSOLE VIA COROUTINES
+        fileLog("Disparando injeção no BinLoader ($ps4Ip:9090)...")
         val result = runBlocking {
-
             payloader.injectDpiPayload(
                 ps4Ip = ps4Ip,
                 localIp = localIp,
@@ -626,86 +366,31 @@ class LocalBridgeServer(
                 contentId = contentId,
                 category = bgftCategory,
                 fileSize = fileSize,
-                iconBytes = null
+                iconBytes = iconBytes
             )
         }
 
-        /*
-         * ============================================================
-         * RESULTADO DO PAYLOADER
-         * ============================================================
-         */
         if (result.isSuccess) {
-
-            fileLog(
-                "PAYLOADER FINALIZADO COM SUCESSO."
-            )
-
+            fileLog("Injeção DPI finalizada com sucesso.")
         } else {
-
-            val error =
-                result.exceptionOrNull()
-
-            fileError(
-                "PAYLOADER FALHOU: " +
-                    (error?.message ?: "erro desconhecido"),
-                error
-            )
+            val error = result.exceptionOrNull()
+            fileError("Falha na injeção DPI: ${error?.message}", error)
         }
 
-        /*
-         * ============================================================
-         * RESPOSTA PARA A INTERFACE
-         * ============================================================
-         */
-        val responseJson =
-            JSONObject().apply {
-
+        // 13. RETORNO PARA O CLIENTE WEB
+        val responseJson = JSONObject().apply {
+            put("success", result.isSuccess)
+            put("catalogIndex", normalizedCatalogIndex)
+            put("contentId", contentId)
+            put("manifestUrl", localManifestUrl)
+            put("packageUrl", directPkgUrl)
+            if (result.isFailure) {
                 put(
-                    "success",
-                    result.isSuccess
+                    "error",
+                    result.exceptionOrNull()?.message ?: "Falha desconhecida na injeção."
                 )
-
-                put(
-                    "catalogIndex",
-                    normalizedCatalogIndex
-                )
-
-                put(
-                    "contentId",
-                    contentId
-                )
-
-                put(
-                    "manifestUrl",
-                    localManifestUrl
-                )
-
-                /*
-                 * Também devolvemos a URL direta para facilitar
-                 * diagnóstico no log/interface.
-                 */
-                put(
-                    "packageUrl",
-                    directPkgUrl
-                )
-
-                if (result.isFailure) {
-
-                    put(
-                        "error",
-                        result.exceptionOrNull()?.message
-                            ?: "Falha desconhecida na injeção."
-                    )
-                }
-            }.toString()
-
-        fileLog(
-            "Resposta enviada à interface: $responseJson"
-        )
-
-        fileLog("FIM DA INJEÇÃO")
-        fileLog("========================================")
+            }
+        }.toString()
 
         return addCors(
             session,
@@ -719,19 +404,8 @@ class LocalBridgeServer(
 
     /*
      * ================================================================
-     * SERVIR MANIFESTO
+     * SERVIR MANIFESTO (COM FALLBACK ANTI-404)
      * ================================================================
-     *
-     * Rota principal:
-     *
-     * /json/1.json
-     *
-     * Também aceitamos:
-     *
-     * /manifest/1.json
-     * /local-manifest.json
-     *
-     * para compatibilidade.
      */
     private fun handleServeLocalManifest(
         session: IHTTPSession
@@ -739,107 +413,48 @@ class LocalBridgeServer(
 
         val uri = session.uri
 
-        /*
-         * ------------------------------------------------------------
-         * /json/1.json
-         * ------------------------------------------------------------
-         */
-        val jsonIndex =
-            if (uri.startsWith("/json/")) {
+        // Extrai a parte da URI referente ao índice
+        val rawRequest = when {
+            uri.startsWith("/json/") -> uri.removePrefix("/json/").removeSuffix(".json")
+            uri.startsWith("/manifest/") -> uri.removePrefix("/manifest/").removeSuffix(".json")
+            else -> session.parameters["id"]?.firstOrNull() ?: ""
+        }.trim()
 
-                uri
-                    .removePrefix("/json/")
-                    .removeSuffix(".json")
+        val numericIndex = rawRequest.filter { it.isDigit() }.toLongOrNull()?.toString()
 
-            } else {
-                null
-            }
+        fileLog("PS4 solicitou manifesto. URI: $uri | Índice bruto: '$rawRequest' | Numérico: '$numericIndex'")
 
-        /*
-         * ------------------------------------------------------------
-         * /manifest/1.json
-         * ------------------------------------------------------------
-         */
-        val legacyIndex =
-            if (uri.startsWith("/manifest/")) {
+        // Busca com 4 níveis de tolerância a falhas
+        val manifest = (if (!numericIndex.isNullOrBlank()) manifestCache[numericIndex] else null)
+            ?: manifestCache[rawRequest]
+            ?: lastCatalogIndex?.let { manifestCache[it] }
+            ?: if (manifestCache.size == 1) manifestCache.values.firstOrNull() else null
 
-                uri
-                    .removePrefix("/manifest/")
-                    .removeSuffix(".json")
-
-            } else {
-                null
-            }
-
-        /*
-         * ------------------------------------------------------------
-         * Determina o índice solicitado
-         * ------------------------------------------------------------
-         */
-        val requestIndex =
-            jsonIndex
-                ?: legacyIndex
-                ?: session.parameters["id"]
-                    ?.firstOrNull()
-                ?: lastCatalogIndex
-
-        fileLog(
-            "PS4 solicitou manifesto: $requestIndex"
-        )
-
-        /*
-         * ------------------------------------------------------------
-         * Procura manifesto
-         * ------------------------------------------------------------
-         */
-        val manifest =
-            if (!requestIndex.isNullOrBlank()) {
-
-                val normalized =
-                    requestIndex
-                        .toLongOrNull()
-                        ?.toString()
-                        ?: requestIndex
-
-                manifestCache[normalized]
-
-            } else {
-
-                null
-            }
-
-        /*
-         * ------------------------------------------------------------
-         * Entrega
-         * ------------------------------------------------------------
-         */
         return if (manifest != null) {
+            fileLog("Manifesto entregue ao console com sucesso!")
 
-            fileLog(
-                "Manifesto entregue com sucesso: $requestIndex"
+            val response = newFixedLengthResponse(
+                Response.Status.OK,
+                "application/json; charset=utf-8",
+                manifest
             )
 
-            addCors(
-                session,
-                newFixedLengthResponse(
-                    Response.Status.OK,
-                    "application/json; charset=utf-8",
-                    manifest
-                )
-            )
+            // Evita que o PS4 guarde cache de manifestos obsoletos
+            response.addHeader("Cache-Control", "no-cache, no-store, must-revalidate")
+            response.addHeader("Pragma", "no-cache")
+            response.addHeader("Expires", "0")
+
+            addCors(session, response)
 
         } else {
-
-            fileWarn(
-                "Manifesto inexistente para: $requestIndex"
-            )
+            fileWarn("Manifesto não encontrado para a requisição: $uri")
 
             addCors(
                 session,
                 newFixedLengthResponse(
                     Response.Status.NOT_FOUND,
                     "application/json",
-                    """{"error":"Manifesto ausente"}"""
+                    """{"error":"Manifesto ausente no servidor local"}"""
                 )
             )
         }
@@ -847,7 +462,7 @@ class LocalBridgeServer(
 
     /*
      * ================================================================
-     * INTERFACE WEB
+     * CARREGAMENTO DA INTERFACE WEB
      * ================================================================
      */
     private fun handleProxyStatic(
@@ -856,242 +471,122 @@ class LocalBridgeServer(
         session: IHTTPSession
     ): Response {
 
-        fileLog(
-            "Carregando interface: $targetUrl"
-        )
+        fileLog("Carregando interface remota: $targetUrl")
 
-        val request =
-            Request.Builder()
-                .url(targetUrl)
-                .build()
+        val request = Request.Builder().url(targetUrl).build()
 
-        return proxyClient
-            .newCall(request)
-            .execute()
-            .use { response ->
+        return proxyClient.newCall(request).execute().use { response ->
+            val body = response.body?.string() ?: "Falha ao carregar interface remota."
 
-                val body =
-                    response.body?.string()
-                        ?: "Falha ao carregar interface remota."
-
-                fileLog(
-                    "Interface remota respondeu HTTP ${response.code}"
+            addCors(
+                session,
+                newFixedLengthResponse(
+                    Response.Status.OK,
+                    mime,
+                    body
                 )
-
-                addCors(
-                    session,
-                    newFixedLengthResponse(
-                        Response.Status.OK,
-                        mime,
-                        body
-                    )
-                )
-            }
+            )
+        }
     }
 
     /*
      * ================================================================
-     * PROXY DA INTERFACE WEB
+     * PROXY REVERSO DE DADOS DA INTERFACE
      * ================================================================
-     *
-     * IMPORTANTE:
-     *
-     * Este proxy continua existindo para a interface web.
-     *
-     * Ele NÃO é usado para transportar PKG.
      */
     private fun handleProxyForward(
         session: IHTTPSession
     ): Response {
 
-        val queryString =
-            if (!session.queryParameterString.isNullOrBlank()) {
-
-                "?${session.queryParameterString}"
-
-            } else {
-                ""
-            }
-
-        val targetUrl =
-            "$adminHost${session.uri}$queryString"
-
-        fileLog(
-            "Proxy -> $targetUrl"
-        )
-
-        val requestBuilder =
-            Request.Builder()
-                .url(targetUrl)
-
-        when (session.method) {
-
-            Method.POST -> {
-
-                val map =
-                    HashMap<String, String>()
-
-                session.parseBody(map)
-
-                val bodyText =
-                    map["postData"] ?: ""
-
-                val contentType =
-                    session.headers["content-type"]
-                        ?: "application/json"
-
-                requestBuilder.post(
-                    bodyText.toRequestBody(
-                        contentType.toMediaTypeOrNull()
-                    )
-                )
-            }
-
-            Method.PUT -> {
-
-                val map =
-                    HashMap<String, String>()
-
-                session.parseBody(map)
-
-                val bodyText =
-                    map["postData"] ?: ""
-
-                val contentType =
-                    session.headers["content-type"]
-                        ?: "application/json"
-
-                requestBuilder.put(
-                    bodyText.toRequestBody(
-                        contentType.toMediaTypeOrNull()
-                    )
-                )
-            }
-
-            Method.DELETE -> {
-
-                requestBuilder.delete()
-            }
-
-            Method.HEAD -> {
-
-                requestBuilder.head()
-            }
-
-            else -> {
-
-                requestBuilder.get()
-            }
+        val queryString = if (!session.queryParameterString.isNullOrBlank()) {
+            "?${session.queryParameterString}"
+        } else {
+            ""
         }
 
-        return proxyClient
-            .newCall(requestBuilder.build())
-            .execute()
-            .use { response ->
+        val targetUrl = "$adminHost${session.uri}$queryString"
+        val requestBuilder = Request.Builder().url(targetUrl)
 
-                val bytes =
-                    response.body?.bytes()
-                        ?: ByteArray(0)
-
-                val contentType =
-                    response.header("Content-Type")
-                        ?: "application/octet-stream"
-
-                val status =
-                    Response.Status.lookup(response.code)
-                        ?: object : Response.IStatus {
-
-                            override fun getRequestStatus(): Int =
-                                response.code
-
-                            override fun getDescription(): String =
-                                response.message
-                        }
-
-                addCors(
-                    session,
-                    newFixedLengthResponse(
-                        status,
-                        contentType,
-                        ByteArrayInputStream(bytes),
-                        bytes.size.toLong()
-                    )
-                )
+        when (session.method) {
+            Method.POST -> {
+                val map = HashMap<String, String>()
+                session.parseBody(map)
+                val bodyText = map["postData"] ?: ""
+                val contentType = session.headers["content-type"] ?: "application/json"
+                requestBuilder.post(bodyText.toRequestBody(contentType.toMediaTypeOrNull()))
             }
+            Method.PUT -> {
+                val map = HashMap<String, String>()
+                session.parseBody(map)
+                val bodyText = map["postData"] ?: ""
+                val contentType = session.headers["content-type"] ?: "application/json"
+                requestBuilder.put(bodyText.toRequestBody(contentType.toMediaTypeOrNull()))
+            }
+            Method.DELETE -> requestBuilder.delete()
+            Method.HEAD -> requestBuilder.head()
+            else -> requestBuilder.get()
+        }
+
+        return proxyClient.newCall(requestBuilder.build()).execute().use { response ->
+            val bytes = response.body?.bytes() ?: ByteArray(0)
+            val contentType = response.header("Content-Type") ?: "application/octet-stream"
+
+            val status = Response.Status.lookup(response.code)
+                ?: object : Response.IStatus {
+                    override fun getRequestStatus(): Int = response.code
+                    override fun getDescription(): String = response.message
+                }
+
+            addCors(
+                session,
+                newFixedLengthResponse(
+                    status,
+                    contentType,
+                    ByteArrayInputStream(bytes),
+                    bytes.size.toLong()
+                )
+            )
+        }
     }
 
     /*
      * ================================================================
-     * DETECÇÃO DO IP WI-FI
+     * DETECÇÃO ROBUSTA DO IP WI-FI LOCAL
      * ================================================================
      */
     private fun getLocalWifiAddress(): String? {
-
         try {
+            val interfaces = NetworkInterface.getNetworkInterfaces()?.toList() ?: return null
 
-            val interfaces =
-                NetworkInterface
-                    .getNetworkInterfaces()
-                    ?.toList()
-                    ?: return null
-
-            val validInterfaces =
-                interfaces
-                    .filter { networkInterface ->
-
-                        val name =
-                            networkInterface.name.lowercase()
-
-                        networkInterface.isUp &&
-                            !networkInterface.isLoopback &&
-                            !name.contains("tun") &&
-                            !name.contains("tap") &&
-                            !name.contains("rmnet") &&
-                            !name.contains("pdp") &&
-                            !name.contains("dummy")
-                    }
-                    .sortedByDescending {
-
-                        it.name.startsWith("wlan") ||
-                            it.name.startsWith("ap")
-                    }
+            val validInterfaces = interfaces.filter { networkInterface ->
+                val name = networkInterface.name.lowercase()
+                networkInterface.isUp &&
+                    !networkInterface.isLoopback &&
+                    !name.contains("tun") &&
+                    !name.contains("tap") &&
+                    !name.contains("rmnet") &&
+                    !name.contains("pdp") &&
+                    !name.contains("dummy")
+            }.sortedByDescending {
+                it.name.startsWith("wlan") || it.name.startsWith("ap") || it.name.startsWith("eth")
+            }
 
             for (networkInterface in validInterfaces) {
-
                 for (address in networkInterface.inetAddresses) {
-
-                    if (
-                        !address.isLoopbackAddress &&
-                        address is Inet4Address &&
-                        address.isSiteLocalAddress
-                    ) {
-
-                        val host =
-                            address.hostAddress
-
-                        fileLog(
-                            "IP Wi-Fi encontrado: $host"
-                        )
-
-                        return host
+                    if (!address.isLoopbackAddress && address is Inet4Address && address.isSiteLocalAddress) {
+                        return address.hostAddress
                     }
                 }
             }
-
         } catch (e: Exception) {
-
-            fileError(
-                "Erro ao detectar IP Wi-Fi: ${e.message}",
-                e
-            )
+            fileError("Erro ao detectar IP local: ${e.message}", e)
         }
-
         return null
     }
 
     /*
      * ================================================================
-     * CORS
+     * CABEÇALHOS CORS
      * ================================================================
      */
     private fun addCors(
@@ -1099,37 +594,20 @@ class LocalBridgeServer(
         response: Response
     ): Response {
 
-        val requestedHeaders =
-            session.headers[
-                "access-control-request-headers"
-            ] ?: "Content-Type, Authorization, Range, X-Requested-With"
+        val requestedHeaders = session.headers["access-control-request-headers"]
+            ?: "Content-Type, Authorization, Range, X-Requested-With"
 
-        response.addHeader(
-            "Access-Control-Allow-Origin",
-            "*"
-        )
-
-        response.addHeader(
-            "Access-Control-Allow-Methods",
-            "GET, POST, OPTIONS, PUT, DELETE"
-        )
-
-        response.addHeader(
-            "Access-Control-Allow-Headers",
-            requestedHeaders
-        )
-
-        response.addHeader(
-            "Access-Control-Max-Age",
-            "86400"
-        )
+        response.addHeader("Access-Control-Allow-Origin", "*")
+        response.addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
+        response.addHeader("Access-Control-Allow-Headers", requestedHeaders)
+        response.addHeader("Access-Control-Max-Age", "86400")
 
         return response
     }
 
     /*
      * ================================================================
-     * ERRO JSON
+     * RESPOSTA PADRÃO DE ERRO JSON
      * ================================================================
      */
     private fun jsonError(
@@ -1138,15 +616,12 @@ class LocalBridgeServer(
         message: String
     ): Response {
 
-        fileError(
-            "Erro HTTP ${status.requestStatus}: $message"
-        )
+        fileError("Erro HTTP ${status.requestStatus}: $message")
 
-        val json =
-            JSONObject()
-                .put("success", false)
-                .put("error", message)
-                .toString()
+        val json = JSONObject()
+            .put("success", false)
+            .put("error", message)
+            .toString()
 
         return addCors(
             session,
@@ -1158,6 +633,3 @@ class LocalBridgeServer(
         )
     }
 }
-
-
-
