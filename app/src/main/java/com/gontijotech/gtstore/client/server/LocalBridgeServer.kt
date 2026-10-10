@@ -274,21 +274,23 @@ class LocalBridgeServer(
 
             val localManifestUrl = "http://$localIp:$port/json/$normalizedCatalogIndex.json"
 
+            // CHAMADA CORRIGIDA PARA O MÉTODO injectDpiPayload COM RETORNO EXPLÍCITO
             val successFlag = runBlocking {
                 try {
-                    payloader.injectPayload(
-                        ps4Ip,
-                        localManifestUrl,
-                        title,
-                        contentId.ifBlank { "EP0000-CUSA00000_00-0000000000000000" },
-                        bgftCategory,
-                        if (fileSize > 0) fileSize else 1024L,
-                        iconBytes
+                    val result = payloader.injectDpiPayload(
+                        ps4Ip = ps4Ip,
+                        localIp = localIp,
+                        manifestUrl = localManifestUrl,
+                        itemTitle = title,
+                        contentId = contentId.ifBlank { "EP0000-CUSA00000_00-0000000000000000" },
+                        category = bgftCategory,
+                        fileSize = if (fileSize > 0) fileSize else 1024L,
+                        iconBytes = iconBytes
                     )
-                    true
+                    return@runBlocking result.isSuccess
                 } catch (e: Exception) {
                     errorMessage = e.message
-                    false
+                    return@runBlocking false
                 }
             }
             finalSuccess = successFlag
